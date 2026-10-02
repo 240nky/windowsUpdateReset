@@ -54,17 +54,14 @@ $ErrorActionPreference = 'Stop'
 $RunTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $LogFilePath  = Join-Path $LogPath "WUReset_$RunTimestamp.log"
 
-# Services that hold the Windows Update cache folders open. All four must be
-# stopped before the folders can be renamed.
+# Services that lock the WU cache folders.
 $WUServiceNames            = 'wuauserv', 'bits', 'cryptsvc', 'msiserver'
 $ServiceStopTimeoutSeconds = 60
 
-# SoftwareDistribution holds the update database and downloads,
-# catroot2 holds the signature catalogs. Both are rebuilt by Windows on next use.
+# Update database/downloads and signature catalogs. Windows rebuilds both.
 $WUCacheFolders = "$env:SystemRoot\SoftwareDistribution", "$env:SystemRoot\System32\catroot2"
 
-# DLLs used by Windows Update, BITS and cryptographic services.
-# Many only exist on older Windows versions; missing ones are skipped.
+# WU-related DLLs. Missing ones are skipped.
 $WUDllNames = @(
     'atl.dll', 'urlmon.dll', 'mshtml.dll', 'shdocvw.dll', 'browseui.dll',
     'jscript.dll', 'vbscript.dll', 'scrrun.dll', 'msxml.dll', 'msxml3.dll',
@@ -76,18 +73,12 @@ $WUDllNames = @(
     'wuwebv.dll'
 )
 
-# Set by any step that fails, and by the install when Windows asks for a reboot.
-# Together they decide the exit code at the end of the script.
+# These two decide the exit code.
 $script:Failed         = $false
 $script:RebootRequired = $false
 
 # ---------------------------------------------------------------- logging ---
-<#
-    Write-Log
-    Writes one line to the log file and to the console: a timestamp and the message.
-    Console output is what the MDM captures, the file is kept on the device for
-    troubleshooting afterwards.
-#>
+# Timestamped line to the log file and console.
 function Write-Log {
     param([string]$Message)
     $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
@@ -96,13 +87,7 @@ function Write-Log {
 }
 
 # --------------------------------------------------------- pre-checks -------
-<#
-    Test-ServiceStartup
-    Returns $false if any of the Windows Update services is set to Disabled.
-    A disabled service is usually set on purpose by GPO, MDM policy or an
-    "update blocker" tool. The script can't start it again, and a reset would
-    leave the device without working updates, so we stop before changing anything.
-#>
+# False if a WU service is disabled (usually by policy).
 function Test-ServiceStartup {
     $allServicesEnabled = $true
     foreach ($serviceName in $WUServiceNames) {
@@ -116,14 +101,7 @@ function Test-ServiceStartup {
     return $allServicesEnabled
 }
 
-<#
-    Test-PendingReboot
-    Returns $true if Windows is already waiting for a reboot.
-    Checks the two registry keys that the servicing stack (CBS) and Windows
-    Update create when a reboot is needed. Installing more updates on top of a
-    pending reboot often fails, so the script stops unless -IgnorePendingReboot
-    is used.
-#>
+# True if Windows is already waiting for a reboot.
 function Test-PendingReboot {
     $rebootRegistryKeys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
@@ -137,15 +115,7 @@ function Test-PendingReboot {
     return $false
 }
 
-<#
-    Test-DriveSpace
-    Returns $false if the system drive has less than -MinFreeGB free.
-    Updates are downloaded to and installed on the system drive; cumulative and
-    feature updates need several GB, and running out mid-install can leave
-    Windows in a bad state.
-    Uses .NET DriveInfo instead of WMI/CIM: devices with broken Windows Update
-    often have a broken WMI repository too, and this check must still work there.
-#>
+# False if the system drive is below -MinFreeGB. Uses DriveInfo so broken WMI can't block it.
 function Test-DriveSpace {
     $systemDrive = [System.IO.DriveInfo]::new($env:SystemDrive)
     $freeGB      = [math]::Round($systemDrive.AvailableFreeSpace / 1GB, 2)
@@ -158,13 +128,7 @@ function Test-DriveSpace {
 }
 
 # --------------------------------------------------------------- services ---
-<#
-    Stop-ServiceProcess
-    Last resort for a service stuck in "Stop pending": kills its process.
-    Several Windows services can share one svchost.exe process. Killing a shared
-    one would take unrelated services down with it, so this only kills the
-    process when the service is the only one running in it.
-#>
+# Kills a stuck service's process, unless it's a shared svchost.
 function Stop-ServiceProcess {
     param([string]$ServiceName)
     $serviceProcessId = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'").ProcessId
@@ -181,13 +145,7 @@ function Stop-ServiceProcess {
     }
 }
 
-<#
-    Stop-WUServices
-    Stops each Windows Update service and waits up to $ServiceStopTimeoutSeconds for it.
-    -Force also stops services that depend on it. If a service doesn't stop in
-    time, Stop-ServiceProcess is used. Services already stopped are skipped, so
-    this is safe to call again (Reset-WUFolders does that between retries).
-#>
+# Stops the WU services, killing any that don't stop in time. Safe to re-run.
 function Stop-WUServices {
     foreach ($serviceName in $WUServiceNames) {
         $service = Get-Service -Name $serviceName
@@ -203,12 +161,7 @@ function Stop-WUServices {
     }
 }
 
-<#
-    Start-WUServices
-    Starts the Windows Update services again after the reset.
-    A service that won't start marks the run as failed, because updates can't
-    be scanned or installed without it.
-#>
+# Starts the WU services. A failure fails the run.
 function Start-WUServices {
     foreach ($serviceName in $WUServiceNames) {
         try {
@@ -222,12 +175,7 @@ function Start-WUServices {
 }
 
 # ------------------------------------------------------- cache folders ------
-<#
-    Remove-OldBackups
-    Deletes SoftwareDistribution.bak_* and catroot2.bak_* folders left by earlier
-    runs. Each backup can be several GB, so this runs before the drive space
-    check. The backup made by the current run is kept until the next run.
-#>
+# Deletes .bak_* folders from earlier runs.
 function Remove-OldBackups {
     foreach ($cacheFolder in $WUCacheFolders) {
         $backupPattern = "$(Split-Path $cacheFolder -Leaf).bak_*"
@@ -242,15 +190,7 @@ function Remove-OldBackups {
     }
 }
 
-<#
-    Reset-WUFolders
-    Renames SoftwareDistribution and catroot2 to <name>.bak_<timestamp>.
-    This is the actual "reset": Windows recreates both folders empty when the
-    services start, which clears a corrupt update database or catalog.
-    A service can be restarted by Windows between the stop and the rename, which
-    locks the folder, so each rename is tried 3 times with the services stopped
-    again in between. If a folder still can't be renamed the run is marked failed.
-#>
+# Renames the cache folders (the actual reset), retrying if a service relocks them.
 function Reset-WUFolders {
     foreach ($cacheFolder in $WUCacheFolders) {
         if (-not (Test-Path $cacheFolder)) {
@@ -278,18 +218,9 @@ function Reset-WUFolders {
 }
 
 # ---------------------------------------------------------------- dlls ------
-<#
-    Register-WUDlls
-    Re-registers the Windows Update related DLLs with regsvr32 /s (silent).
-    This repairs broken COM registrations, a cause of errors like 0x80070002 or
-    "class not registered".
-    Every non-zero regsvr32 exit code is logged with what it means. Code 4 is
-    expected for several DLLs on Windows 10/11 and is harmless; codes 3 and 5
-    point at a damaged or blocked DLL and are worth looking into (try -Repair).
-    Ends with a count of each outcome.
-#>
+# Re-registers the WU DLLs and explains any regsvr32 failure. Code 4 is harmless.
 function Register-WUDlls {
-    # regsvr32 exit codes (from its source: FAIL_ARGS .. FAIL_REG).
+    # regsvr32 exit codes.
     $regsvrExitMeanings = @{
         1 = 'invalid arguments passed to regsvr32'
         2 = 'OLE/COM could not be initialised in regsvr32'
@@ -322,16 +253,7 @@ function Register-WUDlls {
 }
 
 # --------------------------------------------------------------- repair -----
-<#
-    Invoke-Repair
-    Only runs with -Repair. Fixes corruption in Windows itself, which a reset
-    alone can't fix (typical errors: 0x800f081f, 0x80073712).
-    - DISM /RestoreHealth repairs the component store, downloading clean files
-      from Windows Update. That's why it runs after the services are started.
-    - sfc /scannow then repairs protected system files from the component store.
-    A DISM failure marks the run as failed. SFC's exit code is only logged,
-    because it doesn't reliably report problems through it.
-#>
+# DISM then SFC (-Repair only). Runs after the reset because DISM needs Windows Update.
 function Invoke-Repair {
     Write-Log 'Running DISM /RestoreHealth (details in C:\Windows\Logs\DISM\dism.log)...'
     $dismProcess = Start-Process "$env:SystemRoot\System32\dism.exe" -ArgumentList '/Online /Cleanup-Image /RestoreHealth' -Wait -PassThru -WindowStyle Hidden
@@ -344,33 +266,17 @@ function Invoke-Repair {
 }
 
 # -------------------------------------------------------- update via COM ----
-<#
-    Format-HResult
-    Turns a COM HResult (a negative Int32) into the usual 0x8024xxxx form that
-    can be looked up in Microsoft's Windows Update error code list.
-#>
+# HResult as 0x8024xxxx, for looking up WU error codes.
 function Format-HResult {
     param([int]$HResult)
     return '0x{0:X8}' -f $HResult
 }
 
-<#
-    Invoke-WUInstall
-    Uses the Windows Update Agent COM API (Microsoft.Update.Session) to:
-    1. Scan for software updates that are not installed and not hidden
-    2. Log the details of each update found (KB, category, size, reboot behaviour)
-    3. Download each update one at a time, logging the result and error code
-    4. Install everything that downloaded in one batch, so Windows can order
-       prerequisites such as servicing stack updates correctly
-    5. Log the result, error code and reboot need of each update, then a summary
-    Stops after step 2 when -SkipInstall is used.
-    Any failed download or install marks the run as failed. A reboot request
-    sets $script:RebootRequired.
-#>
+# Scan, download (one at a time) and install (one batch) via the WU COM API.
 function Invoke-WUInstall {
-    # OperationResultCode values returned by the WU API.
+    # WU API result codes.
     $resultNames = @{ 0 = 'NotStarted'; 1 = 'InProgress'; 2 = 'Succeeded'; 3 = 'SucceededWithErrors'; 4 = 'Failed'; 5 = 'Aborted' }
-    # InstallationBehavior.RebootBehavior values.
+    # Update reboot behaviour.
     $rebootBehaviorNames = @{ 0 = 'No reboot'; 1 = 'Always needs reboot'; 2 = 'May need reboot' }
 
     $agentVersion = (Get-Item "$env:SystemRoot\System32\wuaueng.dll").VersionInfo.ProductVersion
@@ -380,7 +286,7 @@ function Invoke-WUInstall {
     $updateSession.ClientApplicationID = 'Reset-WindowsUpdate'
     $searcher      = $updateSession.CreateUpdateSearcher()
 
-    # ---- 1. scan
+    # ---- scan
     $searchCriteria = "IsInstalled=0 and Type='Software' and IsHidden=0"
     Write-Log "Scanning for updates (criteria: $searchCriteria)..."
     $stopwatch    = [Diagnostics.Stopwatch]::StartNew()
@@ -389,7 +295,7 @@ function Invoke-WUInstall {
     Write-Log "Found $($searchResult.Updates.Count) update(s)"
     if ($searchResult.Updates.Count -eq 0) { return }
 
-    # ---- 2. list what was found
+    # ---- list
     $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
     $totalSizeMB      = 0
     $updateNumber     = 0
@@ -419,7 +325,7 @@ function Invoke-WUInstall {
         return
     }
 
-    # ---- 3. download, one update at a time for per-update progress
+    # ---- download, one at a time
     $downloader = $updateSession.CreateUpdateDownloader()
     $downloadedUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
     $failedDownloadCount = 0
@@ -457,7 +363,7 @@ function Invoke-WUInstall {
         return
     }
 
-    # ---- 4. install, as one batch
+    # ---- install, one batch
     Write-Log "Installing $($downloadedUpdates.Count) update(s), this can take a while..."
     $installer = $updateSession.CreateUpdateInstaller()
     $installer.Updates = $downloadedUpdates
@@ -467,7 +373,7 @@ function Invoke-WUInstall {
     Write-Log "Install finished in $([int]$stopwatch.Elapsed.TotalMinutes) min, result: $($resultNames[$resultCode]) (HResult $(Format-HResult $installResult.HResult))"
     if ($resultCode -ne 2) { $script:Failed = $true }
 
-    # ---- 5. per-update results and summary
+    # ---- results
     $installedCount     = 0
     $failedInstallCount = 0
     for ($index = 0; $index -lt $downloadedUpdates.Count; $index++) {
@@ -486,9 +392,7 @@ function Invoke-WUInstall {
 }
 
 # ------------------------------------------------------------------- main ---
-# Order matters: checks that change nothing run first, so a device that can't
-# be fixed by this script is left untouched. Any unexpected error restarts the
-# services so the device isn't left without Windows Update.
+# Checks first, so a device that can't be fixed is left untouched.
 New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
 Write-Log "=== Windows Update reset started on $env:COMPUTERNAME as $env:USERNAME ==="
 
@@ -513,7 +417,7 @@ try {
     Start-WUServices
 }
 
-# Last line is what most MDM consoles show as the script output.
+# MDM consoles show the last line.
 if ($script:Failed) {
     Write-Log 'RESULT: Failed, see log for details.'
     exit 1

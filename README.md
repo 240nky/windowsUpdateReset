@@ -15,6 +15,8 @@ Built to run unattended from MDM as SYSTEM.
 8. Scans, downloads and installs updates using the `Microsoft.Update.Session` COM object
 
 Every step is written to `C:\Windows\Logs\WUReset\` as one line per step: a timestamp and a message.
+The update section logs each update's KB, category, size and reboot behaviour, the result and
+error code (HResult) of each download and install, and a final summary.
 The last line of output is a `RESULT:` summary, which MDM consoles show as the script output.
 
 ## Usage
@@ -50,7 +52,8 @@ Win32 app so it's reported as a soft reboot.
 ## MDM notes
 
 - Run as SYSTEM (Intune: "Run this script using the logged on credentials" = **No**).
-- 32-bit PowerShell is detected and the script relaunches itself in 64-bit PowerShell.
+- Run in 64-bit PowerShell (Intune: "Run script in 64-bit PowerShell host" = **Yes**). In 32-bit
+  PowerShell, `System32` is redirected to `SysWOW64`, so the wrong `catroot2` and DLLs get touched.
 - Downloading and installing (and `-Repair`) can take a long time; MDM script timeouts may cut it off on slow devices.
 - Don't run it over remote PowerShell (`Invoke-Command` / `Enter-PSSession`): the update COM
   object refuses to download or install from a remote session.

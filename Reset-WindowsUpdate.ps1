@@ -4,7 +4,7 @@
     Resets Windows Update components, then scans, downloads and installs updates.
 
 .DESCRIPTION
-    Built to run unattended from MDM (as SYSTEM).
+    Built to run unattended from MDM (as SYSTEM, in 64-bit PowerShell).
 
     1. Checks the WU services are not disabled and no reboot is pending
     2. Removes backups left by previous runs and checks free space
@@ -50,29 +50,21 @@ param(
     [int]$RebootExitCode = 0
 )
 
-# MDM agents often start 32-bit PowerShell, where System32 is redirected to SysWOW64.
-# Relaunch in 64-bit PowerShell so the right folders and DLLs are touched.
-if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
-    foreach ($p in $PSBoundParameters.GetEnumerator()) {
-        if ($p.Value -is [switch]) {
-            if ($p.Value) { $argList += "-$($p.Key)" }
-        } else {
-            $argList += "-$($p.Key)", "$($p.Value)"
-        }
-    }
-    & "$env:SystemRoot\SysNative\WindowsPowerShell\v1.0\powershell.exe" @argList
-    exit $LASTEXITCODE
-}
-
 $ErrorActionPreference = 'Stop'
 $Stamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
 $LogFile = Join-Path $LogPath "WUReset_$Stamp.log"
 
+# Services that hold the Windows Update cache folders open. All four must be
+# stopped before the folders can be renamed.
 $Services          = 'wuauserv', 'bits', 'cryptsvc', 'msiserver'
 $ServiceTimeoutSec = 60
-$WUFolders         = "$env:SystemRoot\SoftwareDistribution", "$env:SystemRoot\System32\catroot2"
 
+# SoftwareDistribution holds the update database and downloads,
+# catroot2 holds the signature catalogs. Both are rebuilt by Windows on next use.
+$WUFolders = "$env:SystemRoot\SoftwareDistribution", "$env:SystemRoot\System32\catroot2"
+
+# DLLs used by Windows Update, BITS and cryptographic services.
+# Many only exist on older Windows versions; missing ones are skipped.
 $Dlls = @(
     'atl.dll', 'urlmon.dll', 'mshtml.dll', 'shdocvw.dll', 'browseui.dll',
     'jscript.dll', 'vbscript.dll', 'scrrun.dll', 'msxml.dll', 'msxml3.dll',
@@ -84,10 +76,18 @@ $Dlls = @(
     'wuwebv.dll'
 )
 
+# Set by any step that fails, and by the install when Windows asks for a reboot.
+# Together they decide the exit code at the end of the script.
 $script:Failed         = $false
 $script:RebootRequired = $false
 
 # ---------------------------------------------------------------- logging ---
+<#
+    Write-Log
+    Writes one line to the log file and to the console: a timestamp and the message.
+    Console output is what the MDM captures, the file is kept on the device for
+    troubleshooting afterwards.
+#>
 function Write-Log {
     param([string]$Message)
     $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
@@ -96,10 +96,19 @@ function Write-Log {
 }
 
 # --------------------------------------------------------- pre-checks -------
+<#
+    Test-ServiceStartup
+    Returns $false if any of the Windows Update services is set to Disabled.
+    A disabled service is usually set on purpose by GPO, MDM policy or an
+    "update blocker" tool. The script can't start it again, and a reset would
+    leave the device without working updates, so we stop before changing anything.
+#>
 function Test-ServiceStartup {
     $ok = $true
     foreach ($name in $Services) {
-        if ((Get-Service -Name $name).StartType -eq 'Disabled') {
+        $startType = (Get-Service -Name $name).StartType
+        Write-Log "Service $name start type: $startType"
+        if ($startType -eq 'Disabled') {
             Write-Log "Service $name is disabled (check GPO/MDM policy)."
             $ok = $false
         }
@@ -107,6 +116,14 @@ function Test-ServiceStartup {
     return $ok
 }
 
+<#
+    Test-PendingReboot
+    Returns $true if Windows is already waiting for a reboot.
+    Checks the two registry keys that the servicing stack (CBS) and Windows
+    Update create when a reboot is needed. Installing more updates on top of a
+    pending reboot often fails, so the script stops unless -IgnorePendingReboot
+    is used.
+#>
 function Test-PendingReboot {
     $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
@@ -116,9 +133,17 @@ function Test-PendingReboot {
             return $true
         }
     }
+    Write-Log 'No pending reboot detected.'
     return $false
 }
 
+<#
+    Test-DriveSpace
+    Returns $false if the system drive has less than -MinFreeGB free.
+    Updates are downloaded to and installed on the system drive; cumulative and
+    feature updates need several GB, and running out mid-install can leave
+    Windows in a bad state.
+#>
 function Test-DriveSpace {
     $disk   = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'"
     $freeGB = [math]::Round($disk.FreeSpace / 1GB, 2)
@@ -131,11 +156,17 @@ function Test-DriveSpace {
 }
 
 # --------------------------------------------------------------- services ---
+<#
+    Stop-ServiceProcess
+    Last resort for a service stuck in "Stop pending": kills its process.
+    Several Windows services can share one svchost.exe process. Killing a shared
+    one would take unrelated services down with it, so this only kills the
+    process when the service is the only one running in it.
+#>
 function Stop-ServiceProcess {
     param([string]$Name)
     $procId = (Get-CimInstance Win32_Service -Filter "Name='$Name'").ProcessId
     if (-not $procId) { return }
-    # Never kill a shared svchost, it would take other services down with it.
     if (@(Get-CimInstance Win32_Service -Filter "ProcessId=$procId").Count -gt 1) {
         Write-Log "$Name shares process $procId with other services, not killing it"
         return
@@ -148,6 +179,13 @@ function Stop-ServiceProcess {
     }
 }
 
+<#
+    Stop-WUServices
+    Stops each Windows Update service and waits up to $ServiceTimeoutSec for it.
+    -Force also stops services that depend on it. If a service doesn't stop in
+    time, Stop-ServiceProcess is used. Services already stopped are skipped, so
+    this is safe to call again (Reset-WUFolders does that between retries).
+#>
 function Stop-WUServices {
     foreach ($name in $Services) {
         $svc = Get-Service -Name $name
@@ -163,6 +201,12 @@ function Stop-WUServices {
     }
 }
 
+<#
+    Start-WUServices
+    Starts the Windows Update services again after the reset.
+    A service that won't start marks the run as failed, because updates can't
+    be scanned or installed without it.
+#>
 function Start-WUServices {
     foreach ($name in $Services) {
         try {
@@ -176,6 +220,12 @@ function Start-WUServices {
 }
 
 # ------------------------------------------------------- cache folders ------
+<#
+    Remove-OldBackups
+    Deletes SoftwareDistribution.bak_* and catroot2.bak_* folders left by earlier
+    runs. Each backup can be several GB, so this runs before the drive space
+    check. The backup made by the current run is kept until the next run.
+#>
 function Remove-OldBackups {
     foreach ($folder in $WUFolders) {
         $pattern = "$(Split-Path $folder -Leaf).bak_*"
@@ -190,9 +240,21 @@ function Remove-OldBackups {
     }
 }
 
+<#
+    Reset-WUFolders
+    Renames SoftwareDistribution and catroot2 to <name>.bak_<timestamp>.
+    This is the actual "reset": Windows recreates both folders empty when the
+    services start, which clears a corrupt update database or catalog.
+    A service can be restarted by Windows between the stop and the rename, which
+    locks the folder, so each rename is tried 3 times with the services stopped
+    again in between. If a folder still can't be renamed the run is marked failed.
+#>
 function Reset-WUFolders {
     foreach ($folder in $WUFolders) {
-        if (-not (Test-Path $folder)) { continue }
+        if (-not (Test-Path $folder)) {
+            Write-Log "$folder does not exist, nothing to rename"
+            continue
+        }
         $newName = "$(Split-Path $folder -Leaf).bak_$Stamp"
         $renamed = $false
         for ($attempt = 1; $attempt -le 3 -and -not $renamed; $attempt++) {
@@ -203,7 +265,7 @@ function Reset-WUFolders {
             } catch {
                 Write-Log "Rename attempt $attempt of $folder failed: $($_.Exception.Message)"
                 Start-Sleep -Seconds 5
-                Stop-WUServices   # something may have restarted a service
+                Stop-WUServices
             }
         }
         if (-not $renamed) {
@@ -214,11 +276,18 @@ function Reset-WUFolders {
 }
 
 # ---------------------------------------------------------------- dlls ------
+<#
+    Register-WUDlls
+    Re-registers the Windows Update related DLLs with regsvr32 /s (silent).
+    This repairs broken COM registrations, a cause of errors like 0x80070002 or
+    "class not registered". Some DLLs on newer Windows don't support
+    registration and return a non-zero code; that's logged and harmless.
+#>
 function Register-WUDlls {
     $sys32 = "$env:SystemRoot\System32"
     foreach ($dll in $Dlls) {
         $path = Join-Path $sys32 $dll
-        if (-not (Test-Path $path)) { continue }   # many are absent on newer Windows
+        if (-not (Test-Path $path)) { continue }
         $proc = Start-Process regsvr32.exe -ArgumentList "/s `"$path`"" -Wait -PassThru -WindowStyle Hidden
         if ($proc.ExitCode -eq 0) {
             Write-Log "Registered $dll"
@@ -229,8 +298,17 @@ function Register-WUDlls {
 }
 
 # --------------------------------------------------------------- repair -----
+<#
+    Invoke-Repair
+    Only runs with -Repair. Fixes corruption in Windows itself, which a reset
+    alone can't fix (typical errors: 0x800f081f, 0x80073712).
+    - DISM /RestoreHealth repairs the component store, downloading clean files
+      from Windows Update. That's why it runs after the services are started.
+    - sfc /scannow then repairs protected system files from the component store.
+    A DISM failure marks the run as failed. SFC's exit code is only logged,
+    because it doesn't reliably report problems through it.
+#>
 function Invoke-Repair {
-    # Runs after the reset so DISM can pull repair files from Windows Update.
     Write-Log 'Running DISM /RestoreHealth (details in C:\Windows\Logs\DISM\dism.log)...'
     $dism = Start-Process "$env:SystemRoot\System32\dism.exe" -ArgumentList '/Online /Cleanup-Image /RestoreHealth' -Wait -PassThru -WindowStyle Hidden
     Write-Log "DISM exit code: $($dism.ExitCode)"
@@ -242,59 +320,155 @@ function Invoke-Repair {
 }
 
 # -------------------------------------------------------- update via COM ----
+<#
+    Format-HResult
+    Turns a COM HResult (a negative Int32) into the usual 0x8024xxxx form that
+    can be looked up in Microsoft's Windows Update error code list.
+#>
+function Format-HResult {
+    param([int]$HResult)
+    return '0x{0:X8}' -f $HResult
+}
+
+<#
+    Get-UpdateSource
+    Describes where this device gets its updates from, for the log.
+    If WSUS is configured by policy, scans go to that server instead of
+    Microsoft, which matters when a scan fails or finds nothing.
+#>
+function Get-UpdateSource {
+    $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $wsus   = (Get-ItemProperty -Path $policy -Name WUServer -ErrorAction SilentlyContinue).WUServer
+    $useIt  = (Get-ItemProperty -Path "$policy\AU" -Name UseWUServer -ErrorAction SilentlyContinue).UseWUServer
+    if ($wsus -and $useIt -eq 1) { return "WSUS ($wsus)" }
+    return 'Windows Update / Windows Update for Business'
+}
+
+<#
+    Invoke-WUInstall
+    Uses the Windows Update Agent COM API (Microsoft.Update.Session) to:
+    1. Scan for software updates that are not installed and not hidden
+    2. Log the details of each update found (KB, category, size, reboot behaviour)
+    3. Download each update one at a time, logging the result and error code
+    4. Install everything that downloaded in one batch, so Windows can order
+       prerequisites such as servicing stack updates correctly
+    5. Log the result, error code and reboot need of each update, then a summary
+    Stops after step 2 when -SkipInstall is used.
+    Any failed download or install marks the run as failed. A reboot request
+    sets $script:RebootRequired.
+#>
 function Invoke-WUInstall {
+    # OperationResultCode values returned by the WU API.
     $resultText = @{ 0 = 'NotStarted'; 1 = 'InProgress'; 2 = 'Succeeded'; 3 = 'SucceededWithErrors'; 4 = 'Failed'; 5 = 'Aborted' }
+    # InstallationBehavior.RebootBehavior values.
+    $rebootText = @{ 0 = 'No reboot'; 1 = 'Always needs reboot'; 2 = 'May need reboot' }
+
+    $agentVersion = (Get-Item "$env:SystemRoot\System32\wuaueng.dll").VersionInfo.ProductVersion
+    Write-Log "Windows Update Agent version: $agentVersion"
+    Write-Log "Update source: $(Get-UpdateSource)"
 
     $session  = New-Object -ComObject Microsoft.Update.Session
+    $session.ClientApplicationID = 'Reset-WindowsUpdate'
     $searcher = $session.CreateUpdateSearcher()
 
-    Write-Log 'Scanning for updates...'
-    $search = $searcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+    # ---- 1. scan
+    $criteria = "IsInstalled=0 and Type='Software' and IsHidden=0"
+    Write-Log "Scanning for updates (criteria: $criteria)..."
+    $timer  = [Diagnostics.Stopwatch]::StartNew()
+    $search = $searcher.Search($criteria)
+    Write-Log "Scan finished in $([int]$timer.Elapsed.TotalSeconds) s, result: $($resultText[[int]$search.ResultCode])"
     Write-Log "Found $($search.Updates.Count) update(s)"
     if ($search.Updates.Count -eq 0) { return }
 
+    # ---- 2. list what was found
     $toInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+    $totalMB   = 0
+    $n = 0
     foreach ($update in $search.Updates) {
-        Write-Log "  - $($update.Title)"
-        if (-not $update.EulaAccepted) { $update.AcceptEula() }
+        $n++
+        $kb       = (@($update.KBArticleIDs) | ForEach-Object { "KB$_" }) -join ', '
+        $category = (@($update.Categories) | ForEach-Object { $_.Name }) -join ', '
+        $sizeMB   = [math]::Round($update.MaxDownloadSize / 1MB, 1)
+        $severity = if ($update.MsrcSeverity) { $update.MsrcSeverity } else { 'n/a' }
+        $reboot   = $rebootText[[int]$update.InstallationBehavior.RebootBehavior]
+        $totalMB += $sizeMB
+
+        Write-Log "[$n/$($search.Updates.Count)] $($update.Title)"
+        Write-Log "    KB: $kb | Category: $category | Severity: $severity"
+        Write-Log "    Size: $sizeMB MB | Downloaded: $($update.IsDownloaded) | Reboot: $reboot"
+
+        if (-not $update.EulaAccepted) {
+            Write-Log '    Accepting licence agreement'
+            $update.AcceptEula()
+        }
         [void]$toInstall.Add($update)
     }
+    Write-Log "Total download size (max): $totalMB MB"
 
     if ($SkipInstall) {
         Write-Log 'SkipInstall set, not downloading or installing.'
         return
     }
 
-    Write-Log 'Downloading updates...'
+    # ---- 3. download, one update at a time for per-update progress
     $downloader = $session.CreateUpdateDownloader()
-    $downloader.Updates = $toInstall
-    $download = $downloader.Download()
-    $code = [int]$download.ResultCode
-    Write-Log "Download result: $($resultText[$code])"
-    if ($code -ne 2) { $script:Failed = $true }
-
     $downloaded = New-Object -ComObject Microsoft.Update.UpdateColl
-    foreach ($update in $toInstall) {
-        if ($update.IsDownloaded) { [void]$downloaded.Add($update) }
+    $failedDownloads = 0
+    for ($i = 0; $i -lt $toInstall.Count; $i++) {
+        $update = $toInstall.Item($i)
+        $label  = "[$($i + 1)/$($toInstall.Count)] $($update.Title)"
+        if ($update.IsDownloaded) {
+            Write-Log "Already downloaded: $label"
+            [void]$downloaded.Add($update)
+            continue
+        }
+        Write-Log "Downloading: $label"
+        $single = New-Object -ComObject Microsoft.Update.UpdateColl
+        [void]$single.Add($update)
+        $downloader.Updates = $single
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $result = $downloader.Download()
+            $code   = [int]$result.ResultCode
+            Write-Log "    $($resultText[$code]) in $([int]$timer.Elapsed.TotalSeconds) s (HResult $(Format-HResult $result.HResult))"
+        } catch {
+            Write-Log "    Download error: $($_.Exception.Message)"
+        }
+        if ($update.IsDownloaded) {
+            [void]$downloaded.Add($update)
+        } else {
+            $failedDownloads++
+            $script:Failed = $true
+        }
     }
+    Write-Log "Downloads: $($downloaded.Count) ready, $failedDownloads failed"
     if ($downloaded.Count -eq 0) {
         Write-Log 'No updates were downloaded, nothing to install.'
         $script:Failed = $true
         return
     }
 
-    Write-Log "Installing $($downloaded.Count) update(s)..."
+    # ---- 4. install, as one batch
+    Write-Log "Installing $($downloaded.Count) update(s), this can take a while..."
     $installer = $session.CreateUpdateInstaller()
     $installer.Updates = $downloaded
+    $timer   = [Diagnostics.Stopwatch]::StartNew()
     $install = $installer.Install()
-    $code = [int]$install.ResultCode
-    Write-Log "Install result: $($resultText[$code])"
+    $code    = [int]$install.ResultCode
+    Write-Log "Install finished in $([int]$timer.Elapsed.TotalMinutes) min, result: $($resultText[$code]) (HResult $(Format-HResult $install.HResult))"
     if ($code -ne 2) { $script:Failed = $true }
 
+    # ---- 5. per-update results and summary
+    $installed      = 0
+    $failedInstalls = 0
     for ($i = 0; $i -lt $downloaded.Count; $i++) {
-        $code = [int]$install.GetUpdateResult($i).ResultCode
-        Write-Log "  $($resultText[$code]): $($downloaded.Item($i).Title)"
+        $r    = $install.GetUpdateResult($i)
+        $rc   = [int]$r.ResultCode
+        if ($rc -eq 2) { $installed++ } else { $failedInstalls++ }
+        Write-Log "[$($i + 1)/$($downloaded.Count)] $($resultText[$rc]): $($downloaded.Item($i).Title)"
+        Write-Log "    HResult $(Format-HResult $r.HResult) | Reboot required: $($r.RebootRequired)"
     }
+    Write-Log "Summary: $installed installed, $failedInstalls failed, $failedDownloads not downloaded"
 
     if ($install.RebootRequired) {
         Write-Log 'A reboot is required to finish installing updates.'
@@ -303,8 +477,12 @@ function Invoke-WUInstall {
 }
 
 # ------------------------------------------------------------------- main ---
+# Order matters: checks that change nothing run first, so a device that can't
+# be fixed by this script is left untouched. Any unexpected error restarts the
+# services so the device isn't left without Windows Update.
 New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
 Write-Log "=== Windows Update reset started on $env:COMPUTERNAME as $env:USERNAME ==="
+Write-Log "OS: $((Get-CimInstance Win32_OperatingSystem).Caption) build $([Environment]::OSVersion.Version)"
 
 try {
     if (-not (Test-ServiceStartup)) { exit 1 }

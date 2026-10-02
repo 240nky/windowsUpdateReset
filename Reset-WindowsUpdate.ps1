@@ -333,20 +333,6 @@ function Format-HResult {
 }
 
 <#
-    Get-UpdateSource
-    Describes where this device gets its updates from, for the log.
-    If WSUS is configured by policy, scans go to that server instead of
-    Microsoft, which matters when a scan fails or finds nothing.
-#>
-function Get-UpdateSource {
-    $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-    $wsus   = (Get-ItemProperty -Path $policy -Name WUServer -ErrorAction SilentlyContinue).WUServer
-    $useIt  = (Get-ItemProperty -Path "$policy\AU" -Name UseWUServer -ErrorAction SilentlyContinue).UseWUServer
-    if ($wsus -and $useIt -eq 1) { return "WSUS ($wsus)" }
-    return 'Windows Update / Windows Update for Business'
-}
-
-<#
     Invoke-WUInstall
     Uses the Windows Update Agent COM API (Microsoft.Update.Session) to:
     1. Scan for software updates that are not installed and not hidden
@@ -367,7 +353,6 @@ function Invoke-WUInstall {
 
     $agentVersion = (Get-Item "$env:SystemRoot\System32\wuaueng.dll").VersionInfo.ProductVersion
     Write-Log "Windows Update Agent version: $agentVersion"
-    Write-Log "Update source: $(Get-UpdateSource)"
 
     $session  = New-Object -ComObject Microsoft.Update.Session
     $session.ClientApplicationID = 'Reset-WindowsUpdate'

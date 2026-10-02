@@ -143,10 +143,12 @@ function Test-PendingReboot {
     Updates are downloaded to and installed on the system drive; cumulative and
     feature updates need several GB, and running out mid-install can leave
     Windows in a bad state.
+    Uses .NET DriveInfo instead of WMI/CIM: devices with broken Windows Update
+    often have a broken WMI repository too, and this check must still work there.
 #>
 function Test-DriveSpace {
-    $disk   = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'"
-    $freeGB = [math]::Round($disk.FreeSpace / 1GB, 2)
+    $disk   = [System.IO.DriveInfo]::new($env:SystemDrive)
+    $freeGB = [math]::Round($disk.AvailableFreeSpace / 1GB, 2)
     Write-Log "Free space on $env:SystemDrive : $freeGB GB (minimum $MinFreeGB GB)"
     if ($freeGB -lt $MinFreeGB) {
         Write-Log "Not enough free space on $env:SystemDrive."
@@ -482,7 +484,6 @@ function Invoke-WUInstall {
 # services so the device isn't left without Windows Update.
 New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
 Write-Log "=== Windows Update reset started on $env:COMPUTERNAME as $env:USERNAME ==="
-Write-Log "OS: $((Get-CimInstance Win32_OperatingSystem).Caption) build $([Environment]::OSVersion.Version)"
 
 try {
     if (-not (Test-ServiceStartup)) { exit 1 }

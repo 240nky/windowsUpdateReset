@@ -282,21 +282,43 @@ function Reset-WUFolders {
     Register-WUDlls
     Re-registers the Windows Update related DLLs with regsvr32 /s (silent).
     This repairs broken COM registrations, a cause of errors like 0x80070002 or
-    "class not registered". Some DLLs on newer Windows don't support
-    registration and return a non-zero code; that's logged and harmless.
+    "class not registered".
+    Every non-zero regsvr32 exit code is logged with what it means. Code 4 is
+    expected for several DLLs on Windows 10/11 and is harmless; codes 3 and 5
+    point at a damaged or blocked DLL and are worth looking into (try -Repair).
+    Ends with a count of each outcome.
 #>
 function Register-WUDlls {
-    $sys32 = "$env:SystemRoot\System32"
+    # regsvr32 exit codes (from its source: FAIL_ARGS .. FAIL_REG).
+    $exitText = @{
+        1 = 'invalid arguments passed to regsvr32'
+        2 = 'OLE/COM could not be initialised in regsvr32'
+        3 = 'DLL could not be loaded: corrupt, wrong architecture, or a dependency is missing'
+        4 = 'DLL has no registration entry point: it does not support regsvr32, harmless'
+        5 = 'DLL registration ran but failed: usually registry access denied or a damaged DLL'
+    }
+    $sys32   = "$env:SystemRoot\System32"
+    $counts  = @{ Registered = 0; NotRegistrable = 0; Failed = 0; Missing = 0 }
+
     foreach ($dll in $Dlls) {
         $path = Join-Path $sys32 $dll
-        if (-not (Test-Path $path)) { continue }
-        $proc = Start-Process regsvr32.exe -ArgumentList "/s `"$path`"" -Wait -PassThru -WindowStyle Hidden
-        if ($proc.ExitCode -eq 0) {
-            Write-Log "Registered $dll"
-        } else {
-            Write-Log "regsvr32 $dll returned $($proc.ExitCode)"
+        if (-not (Test-Path $path)) {
+            $counts.Missing++
+            continue
         }
+        $proc = Start-Process regsvr32.exe -ArgumentList "/s `"$path`"" -Wait -PassThru -WindowStyle Hidden
+        $code = $proc.ExitCode
+        if ($code -eq 0) {
+            Write-Log "Registered $dll"
+            $counts.Registered++
+            continue
+        }
+        $meaning = if ($exitText.ContainsKey($code)) { $exitText[$code] } else { 'unknown regsvr32 exit code' }
+        Write-Log "regsvr32 $dll returned $code - $meaning"
+        if ($code -eq 4) { $counts.NotRegistrable++ } else { $counts.Failed++ }
     }
+    Write-Log ("DLLs: {0} registered, {1} not registrable (harmless), {2} failed, {3} not present" -f
+        $counts.Registered, $counts.NotRegistrable, $counts.Failed, $counts.Missing)
 }
 
 # --------------------------------------------------------------- repair -----

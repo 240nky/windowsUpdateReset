@@ -38,474 +38,750 @@
 
 .EXAMPLE
     .\Reset-WindowsUpdate.ps1
+
+.EXAMPLE
     .\Reset-WindowsUpdate.ps1 -MinFreeGB 20 -SkipInstall
 #>
+
 [CmdletBinding()]
 param(
-    [int]$MinFreeGB = 10,
-    [string]$LogPath = "$env:SystemRoot\Logs\WUReset",
-    [switch]$SkipInstall,
-    [switch]$IgnorePendingReboot,
-    [switch]$Repair,
-    [int]$RebootExitCode = 0
+    [int]    $MinFreeGB      = 10,
+    [string] $LogPath        = "$env:SystemRoot\Logs\WUReset",
+    [switch] $SkipInstall,
+    [switch] $IgnorePendingReboot,
+    [switch] $Repair,
+    [int]    $RebootExitCode = 0
 )
+
+
+#region Settings ==============================================================
 
 $ErrorActionPreference = 'Stop'
-$Stamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
-$LogFile = Join-Path $LogPath "WUReset_$Stamp.log"
 
-# Services that hold the Windows Update cache folders open. All four must be
-# stopped before the folders can be renamed.
-$Services          = 'wuauserv', 'bits', 'cryptsvc', 'msiserver'
-$ServiceTimeoutSec = 60
+$RunTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$LogFilePath  = Join-Path $LogPath "WUReset_$RunTimestamp.log"
 
-# SoftwareDistribution holds the update database and downloads,
-# catroot2 holds the signature catalogs. Both are rebuilt by Windows on next use.
-$WUFolders = "$env:SystemRoot\SoftwareDistribution", "$env:SystemRoot\System32\catroot2"
+# Services that keep the update cache folders locked.
+# All of them must be stopped before the folders can be renamed.
+$WUServiceNames            = @('wuauserv', 'bits', 'cryptsvc', 'msiserver')
+$ServiceStopTimeoutSeconds = 60
 
-# DLLs used by Windows Update, BITS and cryptographic services.
+# The update cache folders. Windows recreates both, empty, on next use.
+$WUCacheFolders = @(
+    "$env:SystemRoot\SoftwareDistribution"   # update database and downloads
+    "$env:SystemRoot\System32\catroot2"      # signature catalogs
+)
+$RenameAttempts = 3
+
+# DLLs used by Windows Update, BITS and the cryptographic services.
 # Many only exist on older Windows versions; missing ones are skipped.
-$Dlls = @(
-    'atl.dll', 'urlmon.dll', 'mshtml.dll', 'shdocvw.dll', 'browseui.dll',
-    'jscript.dll', 'vbscript.dll', 'scrrun.dll', 'msxml.dll', 'msxml3.dll',
-    'msxml6.dll', 'actxprxy.dll', 'softpub.dll', 'wintrust.dll', 'dssenh.dll',
-    'rsaenh.dll', 'gpkcsp.dll', 'sccbase.dll', 'slbcsp.dll', 'cryptdlg.dll',
-    'oleaut32.dll', 'ole32.dll', 'shell32.dll', 'initpki.dll', 'wuapi.dll',
-    'wuaueng.dll', 'wuaueng1.dll', 'wucltui.dll', 'wups.dll', 'wups2.dll',
-    'wuweb.dll', 'qmgr.dll', 'qmgrprxy.dll', 'wucltux.dll', 'muweb.dll',
+$WUDllNames = @(
+    'atl.dll',      'urlmon.dll',   'mshtml.dll',   'shdocvw.dll',  'browseui.dll',
+    'jscript.dll',  'vbscript.dll', 'scrrun.dll',   'msxml.dll',    'msxml3.dll',
+    'msxml6.dll',   'actxprxy.dll', 'softpub.dll',  'wintrust.dll', 'dssenh.dll',
+    'rsaenh.dll',   'gpkcsp.dll',   'sccbase.dll',  'slbcsp.dll',   'cryptdlg.dll',
+    'oleaut32.dll', 'ole32.dll',    'shell32.dll',  'initpki.dll',  'wuapi.dll',
+    'wuaueng.dll',  'wuaueng1.dll', 'wucltui.dll',  'wups.dll',     'wups2.dll',
+    'wuweb.dll',    'qmgr.dll',     'qmgrprxy.dll', 'wucltux.dll',  'muweb.dll',
     'wuwebv.dll'
 )
+
+# Result codes returned by the Windows Update API (OperationResultCode).
+$WUResultNames = @{
+    0 = 'NotStarted'
+    1 = 'InProgress'
+    2 = 'Succeeded'
+    3 = 'SucceededWithErrors'
+    4 = 'Failed'
+    5 = 'Aborted'
+}
+$WUResultSucceeded = 2
+
+# Reboot behaviour of an update (InstallationBehavior.RebootBehavior).
+$WURebootBehaviorNames = @{
+    0 = 'No reboot'
+    1 = 'Always needs reboot'
+    2 = 'May need reboot'
+}
+
+# regsvr32 exit codes (FAIL_ARGS .. FAIL_REG in its source).
+$RegsvrExitMeanings = @{
+    1 = 'invalid arguments passed to regsvr32'
+    2 = 'OLE/COM could not be initialised in regsvr32'
+    3 = 'DLL could not be loaded: corrupt, wrong architecture, or a dependency is missing'
+    4 = 'DLL has no registration entry point: it does not support regsvr32, harmless'
+    5 = 'DLL registration ran but failed: usually registry access denied or a damaged DLL'
+}
+$RegsvrNotRegistrable = 4
 
 # Set by any step that fails, and by the install when Windows asks for a reboot.
 # Together they decide the exit code at the end of the script.
 $script:Failed         = $false
 $script:RebootRequired = $false
 
-# ---------------------------------------------------------------- logging ---
+#endregion
+
+
+#region Helpers ===============================================================
+
 <#
-    Write-Log
-    Writes one line to the log file and to the console: a timestamp and the message.
-    Console output is what the MDM captures, the file is kept on the device for
-    troubleshooting afterwards.
+.SYNOPSIS
+    Writes one line to the log file and to the console.
+.DESCRIPTION
+    Each line is a timestamp followed by the message.
+    The console output is what the MDM captures; the log file stays on the
+    device for troubleshooting afterwards.
 #>
 function Write-Log {
-    param([string]$Message)
-    $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
-    Add-Content -Path $LogFile -Value $line
-    Write-Host $line
+    param(
+        [string] $Message
+    )
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $logLine   = "$timestamp $Message"
+
+    Add-Content -Path $LogFilePath -Value $logLine
+    Write-Host $logLine
 }
 
-# --------------------------------------------------------- pre-checks -------
 <#
-    Test-ServiceStartup
-    Returns $false if any of the Windows Update services is set to Disabled.
+.SYNOPSIS
+    Runs a program hidden, waits for it to finish and returns its exit code.
+.DESCRIPTION
+    Used for regsvr32, DISM and SFC, which don't need any input.
+#>
+function Invoke-HiddenProcess {
+    param(
+        [string] $FilePath,
+        [string] $Arguments
+    )
+
+    $processOptions = @{
+        FilePath     = $FilePath
+        ArgumentList = $Arguments
+        Wait         = $true
+        PassThru     = $true
+        WindowStyle  = 'Hidden'
+    }
+
+    $process = Start-Process @processOptions
+    return $process.ExitCode
+}
+
+<#
+.SYNOPSIS
+    Formats a COM HResult as 0x8024xxxx.
+.DESCRIPTION
+    The Windows Update API reports errors as a negative Int32. Shown in hex,
+    the code can be looked up in Microsoft's Windows Update error code list.
+#>
+function Format-HResult {
+    param(
+        [int] $HResult
+    )
+
+    return '0x{0:X8}' -f $HResult
+}
+
+#endregion
+
+
+#region Pre-checks ============================================================
+
+<#
+.SYNOPSIS
+    Returns $false if any Windows Update service is set to Disabled.
+.DESCRIPTION
     A disabled service is usually set on purpose by GPO, MDM policy or an
     "update blocker" tool. The script can't start it again, and a reset would
-    leave the device without working updates, so we stop before changing anything.
+    leave the device without working updates, so the script stops before
+    changing anything.
 #>
 function Test-ServiceStartup {
-    $ok = $true
-    foreach ($name in $Services) {
-        $startType = (Get-Service -Name $name).StartType
-        Write-Log "Service $name start type: $startType"
+    $allServicesEnabled = $true
+
+    foreach ($serviceName in $WUServiceNames) {
+        $startType = (Get-Service -Name $serviceName).StartType
+        Write-Log "Service $serviceName start type: $startType"
+
         if ($startType -eq 'Disabled') {
-            Write-Log "Service $name is disabled (check GPO/MDM policy)."
-            $ok = $false
+            Write-Log "Service $serviceName is disabled (check GPO/MDM policy)."
+            $allServicesEnabled = $false
         }
     }
-    return $ok
+
+    return $allServicesEnabled
 }
 
 <#
-    Test-PendingReboot
+.SYNOPSIS
     Returns $true if Windows is already waiting for a reboot.
-    Checks the two registry keys that the servicing stack (CBS) and Windows
-    Update create when a reboot is needed. Installing more updates on top of a
-    pending reboot often fails, so the script stops unless -IgnorePendingReboot
-    is used.
+.DESCRIPTION
+    Checks the registry keys that the servicing stack (CBS) and Windows Update
+    create when a reboot is needed. Installing more updates on top of a pending
+    reboot often fails, so the script stops unless -IgnorePendingReboot is used.
 #>
 function Test-PendingReboot {
-    $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
-            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-    foreach ($key in $keys) {
-        if (Test-Path $key) {
-            Write-Log "Pending reboot detected: $key"
+    $rebootRegistryKeys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )
+
+    foreach ($registryKey in $rebootRegistryKeys) {
+        if (Test-Path $registryKey) {
+            Write-Log "Pending reboot detected: $registryKey"
             return $true
         }
     }
+
     Write-Log 'No pending reboot detected.'
     return $false
 }
 
 <#
-    Test-DriveSpace
+.SYNOPSIS
     Returns $false if the system drive has less than -MinFreeGB free.
-    Updates are downloaded to and installed on the system drive; cumulative and
+.DESCRIPTION
+    Updates are downloaded to and installed on the system drive. Cumulative and
     feature updates need several GB, and running out mid-install can leave
     Windows in a bad state.
+
     Uses .NET DriveInfo instead of WMI/CIM: devices with broken Windows Update
     often have a broken WMI repository too, and this check must still work there.
 #>
 function Test-DriveSpace {
-    $disk   = [System.IO.DriveInfo]::new($env:SystemDrive)
-    $freeGB = [math]::Round($disk.AvailableFreeSpace / 1GB, 2)
+    $systemDrive = [System.IO.DriveInfo]::new($env:SystemDrive)
+    $freeGB      = [math]::Round($systemDrive.AvailableFreeSpace / 1GB, 2)
+
     Write-Log "Free space on $env:SystemDrive : $freeGB GB (minimum $MinFreeGB GB)"
+
     if ($freeGB -lt $MinFreeGB) {
         Write-Log "Not enough free space on $env:SystemDrive."
         return $false
     }
+
     return $true
 }
 
-# --------------------------------------------------------------- services ---
+#endregion
+
+
+#region Services ==============================================================
+
 <#
-    Stop-ServiceProcess
-    Last resort for a service stuck in "Stop pending": kills its process.
+.SYNOPSIS
+    Kills the process of a service stuck in "Stop pending".
+.DESCRIPTION
+    Last resort, only used after the stop timeout.
     Several Windows services can share one svchost.exe process. Killing a shared
-    one would take unrelated services down with it, so this only kills the
-    process when the service is the only one running in it.
+    one would take unrelated services down with it, so the process is only
+    killed when this service is the only one running in it.
 #>
 function Stop-ServiceProcess {
-    param([string]$Name)
-    $procId = (Get-CimInstance Win32_Service -Filter "Name='$Name'").ProcessId
-    if (-not $procId) { return }
-    if (@(Get-CimInstance Win32_Service -Filter "ProcessId=$procId").Count -gt 1) {
-        Write-Log "$Name shares process $procId with other services, not killing it"
+    param(
+        [string] $ServiceName
+    )
+
+    $serviceProcessId = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'").ProcessId
+    if (-not $serviceProcessId) {
         return
     }
+
+    $servicesInProcess = @(Get-CimInstance Win32_Service -Filter "ProcessId=$serviceProcessId")
+    if ($servicesInProcess.Count -gt 1) {
+        Write-Log "$ServiceName shares process $serviceProcessId with other services, not killing it"
+        return
+    }
+
     try {
-        Stop-Process -Id $procId -Force -ErrorAction Stop
-        Write-Log "Killed process $procId for $Name"
+        Stop-Process -Id $serviceProcessId -Force -ErrorAction Stop
+        Write-Log "Killed process $serviceProcessId for $ServiceName"
     } catch {
-        Write-Log "Could not kill process $procId for $Name : $($_.Exception.Message)"
+        Write-Log "Could not kill process $serviceProcessId for $ServiceName : $($_.Exception.Message)"
     }
 }
 
 <#
-    Stop-WUServices
-    Stops each Windows Update service and waits up to $ServiceTimeoutSec for it.
-    -Force also stops services that depend on it. If a service doesn't stop in
-    time, Stop-ServiceProcess is used. Services already stopped are skipped, so
-    this is safe to call again (Reset-WUFolders does that between retries).
+.SYNOPSIS
+    Stops the Windows Update services, waiting up to the stop timeout for each.
+.DESCRIPTION
+    -Force also stops services that depend on them. A service that doesn't stop
+    in time is handed to Stop-ServiceProcess.
+    Services that are already stopped are skipped, so this is safe to call
+    again (Reset-WUFolders does that between rename attempts).
 #>
 function Stop-WUServices {
-    foreach ($name in $Services) {
-        $svc = Get-Service -Name $name
-        if ($svc.Status -eq 'Stopped') { continue }
-        Write-Log "Stopping service $name"
+    $stopTimeout = [TimeSpan]::FromSeconds($ServiceStopTimeoutSeconds)
+
+    foreach ($serviceName in $WUServiceNames) {
+        $service = Get-Service -Name $serviceName
+        if ($service.Status -eq 'Stopped') {
+            continue
+        }
+
+        Write-Log "Stopping service $serviceName"
+
         try {
-            Stop-Service -Name $name -Force -NoWait -ErrorAction Stop
-            $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds($ServiceTimeoutSec))
+            Stop-Service -Name $serviceName -Force -NoWait -ErrorAction Stop
+            $service.WaitForStatus('Stopped', $stopTimeout)
         } catch {
-            Write-Log "$name did not stop within $ServiceTimeoutSec s: $($_.Exception.Message)"
-            Stop-ServiceProcess $name
+            Write-Log "$serviceName did not stop within $ServiceStopTimeoutSeconds s: $($_.Exception.Message)"
+            Stop-ServiceProcess -ServiceName $serviceName
         }
     }
 }
 
 <#
-    Start-WUServices
+.SYNOPSIS
     Starts the Windows Update services again after the reset.
+.DESCRIPTION
     A service that won't start marks the run as failed, because updates can't
     be scanned or installed without it.
 #>
 function Start-WUServices {
-    foreach ($name in $Services) {
+    foreach ($serviceName in $WUServiceNames) {
+        Write-Log "Starting service $serviceName"
+
         try {
-            Write-Log "Starting service $name"
-            Start-Service -Name $name -ErrorAction Stop
+            Start-Service -Name $serviceName -ErrorAction Stop
         } catch {
-            Write-Log "Could not start $name : $($_.Exception.Message)"
+            Write-Log "Could not start $serviceName : $($_.Exception.Message)"
             $script:Failed = $true
         }
     }
 }
 
-# ------------------------------------------------------- cache folders ------
+#endregion
+
+
+#region Cache folders =========================================================
+
 <#
-    Remove-OldBackups
-    Deletes SoftwareDistribution.bak_* and catroot2.bak_* folders left by earlier
-    runs. Each backup can be several GB, so this runs before the drive space
-    check. The backup made by the current run is kept until the next run.
+.SYNOPSIS
+    Deletes the backup folders left by earlier runs.
+.DESCRIPTION
+    Removes SoftwareDistribution.bak_* and catroot2.bak_*. Each backup can be
+    several GB, so this runs before the drive space check. The backup made by
+    the current run is kept until the next run.
 #>
 function Remove-OldBackups {
-    foreach ($folder in $WUFolders) {
-        $pattern = "$(Split-Path $folder -Leaf).bak_*"
-        foreach ($dir in Get-ChildItem -Path (Split-Path $folder -Parent) -Directory -Filter $pattern) {
+    foreach ($cacheFolder in $WUCacheFolders) {
+        $parentFolder  = Split-Path $cacheFolder -Parent
+        $backupPattern = "$(Split-Path $cacheFolder -Leaf).bak_*"
+        $oldBackups    = Get-ChildItem -Path $parentFolder -Directory -Filter $backupPattern
+
+        foreach ($backupFolder in $oldBackups) {
             try {
-                Remove-Item -Path $dir.FullName -Recurse -Force -ErrorAction Stop
-                Write-Log "Removed old backup $($dir.FullName)"
+                Remove-Item -Path $backupFolder.FullName -Recurse -Force -ErrorAction Stop
+                Write-Log "Removed old backup $($backupFolder.FullName)"
             } catch {
-                Write-Log "Could not remove $($dir.FullName) : $($_.Exception.Message)"
+                Write-Log "Could not remove $($backupFolder.FullName) : $($_.Exception.Message)"
             }
         }
     }
 }
 
 <#
-    Reset-WUFolders
+.SYNOPSIS
     Renames SoftwareDistribution and catroot2 to <name>.bak_<timestamp>.
-    This is the actual "reset": Windows recreates both folders empty when the
+.DESCRIPTION
+    This is the actual reset: Windows recreates both folders empty when the
     services start, which clears a corrupt update database or catalog.
-    A service can be restarted by Windows between the stop and the rename, which
-    locks the folder, so each rename is tried 3 times with the services stopped
-    again in between. If a folder still can't be renamed the run is marked failed.
+
+    Windows can restart a service between the stop and the rename, which locks
+    the folder again. Each rename is therefore tried several times, with the
+    services stopped again in between. If a folder still can't be renamed, the
+    run is marked as failed.
 #>
 function Reset-WUFolders {
-    foreach ($folder in $WUFolders) {
-        if (-not (Test-Path $folder)) {
-            Write-Log "$folder does not exist, nothing to rename"
+    foreach ($cacheFolder in $WUCacheFolders) {
+        if (-not (Test-Path $cacheFolder)) {
+            Write-Log "$cacheFolder does not exist, nothing to rename"
             continue
         }
-        $newName = "$(Split-Path $folder -Leaf).bak_$Stamp"
-        $renamed = $false
-        for ($attempt = 1; $attempt -le 3 -and -not $renamed; $attempt++) {
+
+        $backupName = "$(Split-Path $cacheFolder -Leaf).bak_$RunTimestamp"
+        $isRenamed  = $false
+
+        for ($attempt = 1; $attempt -le $RenameAttempts -and -not $isRenamed; $attempt++) {
             try {
-                Rename-Item -Path $folder -NewName $newName -ErrorAction Stop
-                Write-Log "Renamed $folder -> $newName"
-                $renamed = $true
+                Rename-Item -Path $cacheFolder -NewName $backupName -ErrorAction Stop
+                Write-Log "Renamed $cacheFolder -> $backupName"
+                $isRenamed = $true
             } catch {
-                Write-Log "Rename attempt $attempt of $folder failed: $($_.Exception.Message)"
+                Write-Log "Rename attempt $attempt of $cacheFolder failed: $($_.Exception.Message)"
                 Start-Sleep -Seconds 5
                 Stop-WUServices
             }
         }
-        if (-not $renamed) {
-            Write-Log "Could not rename $folder, reset is incomplete."
+
+        if (-not $isRenamed) {
+            Write-Log "Could not rename $cacheFolder, reset is incomplete."
             $script:Failed = $true
         }
     }
 }
 
-# ---------------------------------------------------------------- dlls ------
+#endregion
+
+
+#region DLL registration ======================================================
+
 <#
-    Register-WUDlls
+.SYNOPSIS
     Re-registers the Windows Update related DLLs with regsvr32 /s (silent).
-    This repairs broken COM registrations, a cause of errors like 0x80070002 or
+.DESCRIPTION
+    Repairs broken COM registrations, a cause of errors like 0x80070002 or
     "class not registered".
-    Every non-zero regsvr32 exit code is logged with what it means. Code 4 is
+
+    Every non-zero regsvr32 exit code is logged with its meaning. Code 4 is
     expected for several DLLs on Windows 10/11 and is harmless; codes 3 and 5
     point at a damaged or blocked DLL and are worth looking into (try -Repair).
     Ends with a count of each outcome.
 #>
 function Register-WUDlls {
-    # regsvr32 exit codes (from its source: FAIL_ARGS .. FAIL_REG).
-    $exitText = @{
-        1 = 'invalid arguments passed to regsvr32'
-        2 = 'OLE/COM could not be initialised in regsvr32'
-        3 = 'DLL could not be loaded: corrupt, wrong architecture, or a dependency is missing'
-        4 = 'DLL has no registration entry point: it does not support regsvr32, harmless'
-        5 = 'DLL registration ran but failed: usually registry access denied or a damaged DLL'
-    }
-    $sys32   = "$env:SystemRoot\System32"
-    $counts  = @{ Registered = 0; NotRegistrable = 0; Failed = 0; Missing = 0 }
+    $system32Path        = "$env:SystemRoot\System32"
+    $registeredCount     = 0
+    $notRegistrableCount = 0
+    $failedCount         = 0
+    $missingCount        = 0
 
-    foreach ($dll in $Dlls) {
-        $path = Join-Path $sys32 $dll
-        if (-not (Test-Path $path)) {
-            $counts.Missing++
+    foreach ($dllName in $WUDllNames) {
+        $dllPath = Join-Path $system32Path $dllName
+
+        if (-not (Test-Path $dllPath)) {
+            $missingCount++
             continue
         }
-        $proc = Start-Process regsvr32.exe -ArgumentList "/s `"$path`"" -Wait -PassThru -WindowStyle Hidden
-        $code = $proc.ExitCode
-        if ($code -eq 0) {
-            Write-Log "Registered $dll"
-            $counts.Registered++
+
+        $exitCode = Invoke-HiddenProcess -FilePath 'regsvr32.exe' -Arguments "/s `"$dllPath`""
+
+        if ($exitCode -eq 0) {
+            Write-Log "Registered $dllName"
+            $registeredCount++
             continue
         }
-        $meaning = if ($exitText.ContainsKey($code)) { $exitText[$code] } else { 'unknown regsvr32 exit code' }
-        Write-Log "regsvr32 $dll returned $code - $meaning"
-        if ($code -eq 4) { $counts.NotRegistrable++ } else { $counts.Failed++ }
+
+        if ($RegsvrExitMeanings.ContainsKey($exitCode)) {
+            $meaning = $RegsvrExitMeanings[$exitCode]
+        } else {
+            $meaning = 'unknown regsvr32 exit code'
+        }
+        Write-Log "regsvr32 $dllName returned $exitCode - $meaning"
+
+        if ($exitCode -eq $RegsvrNotRegistrable) {
+            $notRegistrableCount++
+        } else {
+            $failedCount++
+        }
     }
+
     Write-Log ("DLLs: {0} registered, {1} not registrable (harmless), {2} failed, {3} not present" -f
-        $counts.Registered, $counts.NotRegistrable, $counts.Failed, $counts.Missing)
+        $registeredCount, $notRegistrableCount, $failedCount, $missingCount)
 }
 
-# --------------------------------------------------------------- repair -----
+#endregion
+
+
+#region Repair ================================================================
+
 <#
-    Invoke-Repair
-    Only runs with -Repair. Fixes corruption in Windows itself, which a reset
-    alone can't fix (typical errors: 0x800f081f, 0x80073712).
+.SYNOPSIS
+    Runs DISM /RestoreHealth and sfc /scannow. Only used with -Repair.
+.DESCRIPTION
+    Fixes corruption in Windows itself, which a reset alone can't fix
+    (typical errors: 0x800f081f, 0x80073712).
+
     - DISM /RestoreHealth repairs the component store, downloading clean files
       from Windows Update. That's why it runs after the services are started.
     - sfc /scannow then repairs protected system files from the component store.
+
     A DISM failure marks the run as failed. SFC's exit code is only logged,
-    because it doesn't reliably report problems through it.
+    because SFC doesn't reliably report problems through it.
 #>
 function Invoke-Repair {
+    $system32Path = "$env:SystemRoot\System32"
+
     Write-Log 'Running DISM /RestoreHealth (details in C:\Windows\Logs\DISM\dism.log)...'
-    $dism = Start-Process "$env:SystemRoot\System32\dism.exe" -ArgumentList '/Online /Cleanup-Image /RestoreHealth' -Wait -PassThru -WindowStyle Hidden
-    Write-Log "DISM exit code: $($dism.ExitCode)"
-    if ($dism.ExitCode -ne 0) { $script:Failed = $true }
+    $dismExitCode = Invoke-HiddenProcess -FilePath "$system32Path\dism.exe" -Arguments '/Online /Cleanup-Image /RestoreHealth'
+    Write-Log "DISM exit code: $dismExitCode"
+
+    if ($dismExitCode -ne 0) {
+        $script:Failed = $true
+    }
 
     Write-Log 'Running sfc /scannow (details in C:\Windows\Logs\CBS\CBS.log)...'
-    $sfc = Start-Process "$env:SystemRoot\System32\sfc.exe" -ArgumentList '/scannow' -Wait -PassThru -WindowStyle Hidden
-    Write-Log "SFC exit code: $($sfc.ExitCode)"
+    $sfcExitCode = Invoke-HiddenProcess -FilePath "$system32Path\sfc.exe" -Arguments '/scannow'
+    Write-Log "SFC exit code: $sfcExitCode"
 }
 
-# -------------------------------------------------------- update via COM ----
-<#
-    Format-HResult
-    Turns a COM HResult (a negative Int32) into the usual 0x8024xxxx form that
-    can be looked up in Microsoft's Windows Update error code list.
-#>
-function Format-HResult {
-    param([int]$HResult)
-    return '0x{0:X8}' -f $HResult
-}
+#endregion
+
+
+#region Windows Update ========================================================
 
 <#
-    Invoke-WUInstall
-    Uses the Windows Update Agent COM API (Microsoft.Update.Session) to:
-    1. Scan for software updates that are not installed and not hidden
-    2. Log the details of each update found (KB, category, size, reboot behaviour)
-    3. Download each update one at a time, logging the result and error code
-    4. Install everything that downloaded in one batch, so Windows can order
-       prerequisites such as servicing stack updates correctly
-    5. Log the result, error code and reboot need of each update, then a summary
-    Stops after step 2 when -SkipInstall is used.
-    Any failed download or install marks the run as failed. A reboot request
-    sets $script:RebootRequired.
+.SYNOPSIS
+    Scans for updates and returns the ones to install.
+.DESCRIPTION
+    Searches for software updates that are not installed and not hidden, logs
+    the details of each one (KB, category, severity, size, reboot behaviour)
+    and accepts licence agreements so the install doesn't stall.
+    Returns a Microsoft.Update.UpdateColl, which may be empty.
 #>
-function Invoke-WUInstall {
-    # OperationResultCode values returned by the WU API.
-    $resultText = @{ 0 = 'NotStarted'; 1 = 'InProgress'; 2 = 'Succeeded'; 3 = 'SucceededWithErrors'; 4 = 'Failed'; 5 = 'Aborted' }
-    # InstallationBehavior.RebootBehavior values.
-    $rebootText = @{ 0 = 'No reboot'; 1 = 'Always needs reboot'; 2 = 'May need reboot' }
+function Find-PendingUpdates {
+    param(
+        $UpdateSession
+    )
 
-    $agentVersion = (Get-Item "$env:SystemRoot\System32\wuaueng.dll").VersionInfo.ProductVersion
-    Write-Log "Windows Update Agent version: $agentVersion"
+    $searchCriteria = "IsInstalled=0 and Type='Software' and IsHidden=0"
+    $searcher       = $UpdateSession.CreateUpdateSearcher()
 
-    $session  = New-Object -ComObject Microsoft.Update.Session
-    $session.ClientApplicationID = 'Reset-WindowsUpdate'
-    $searcher = $session.CreateUpdateSearcher()
+    Write-Log "Scanning for updates (criteria: $searchCriteria)..."
 
-    # ---- 1. scan
-    $criteria = "IsInstalled=0 and Type='Software' and IsHidden=0"
-    Write-Log "Scanning for updates (criteria: $criteria)..."
-    $timer  = [Diagnostics.Stopwatch]::StartNew()
-    $search = $searcher.Search($criteria)
-    Write-Log "Scan finished in $([int]$timer.Elapsed.TotalSeconds) s, result: $($resultText[[int]$search.ResultCode])"
-    Write-Log "Found $($search.Updates.Count) update(s)"
-    if ($search.Updates.Count -eq 0) { return }
+    $stopwatch    = [Diagnostics.Stopwatch]::StartNew()
+    $searchResult = $searcher.Search($searchCriteria)
+    $scanSeconds  = [int]$stopwatch.Elapsed.TotalSeconds
+    $scanResult   = $WUResultNames[[int]$searchResult.ResultCode]
 
-    # ---- 2. list what was found
-    $toInstall = New-Object -ComObject Microsoft.Update.UpdateColl
-    $totalMB   = 0
-    $n = 0
-    foreach ($update in $search.Updates) {
-        $n++
-        $kb       = (@($update.KBArticleIDs) | ForEach-Object { "KB$_" }) -join ', '
-        $category = (@($update.Categories) | ForEach-Object { $_.Name }) -join ', '
-        $sizeMB   = [math]::Round($update.MaxDownloadSize / 1MB, 1)
-        $severity = if ($update.MsrcSeverity) { $update.MsrcSeverity } else { 'n/a' }
-        $reboot   = $rebootText[[int]$update.InstallationBehavior.RebootBehavior]
-        $totalMB += $sizeMB
+    Write-Log "Scan finished in $scanSeconds s, result: $scanResult"
+    Write-Log "Found $($searchResult.Updates.Count) update(s)"
 
-        Write-Log "[$n/$($search.Updates.Count)] $($update.Title)"
-        Write-Log "    KB: $kb | Category: $category | Severity: $severity"
-        Write-Log "    Size: $sizeMB MB | Downloaded: $($update.IsDownloaded) | Reboot: $reboot"
+    $pendingUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
+    $totalSizeMB    = 0
+    $updateNumber   = 0
+    $updateCount    = $searchResult.Updates.Count
+
+    foreach ($update in $searchResult.Updates) {
+        $updateNumber++
+
+        $kbNumbers      = (@($update.KBArticleIDs) | ForEach-Object { "KB$_" }) -join ', '
+        $categories     = (@($update.Categories) | ForEach-Object { $_.Name }) -join ', '
+        $sizeMB         = [math]::Round($update.MaxDownloadSize / 1MB, 1)
+        $rebootBehavior = $WURebootBehaviorNames[[int]$update.InstallationBehavior.RebootBehavior]
+
+        if ($update.MsrcSeverity) {
+            $severity = $update.MsrcSeverity
+        } else {
+            $severity = 'n/a'
+        }
+
+        Write-Log "[$updateNumber/$updateCount] $($update.Title)"
+        Write-Log "    KB: $kbNumbers | Category: $categories | Severity: $severity"
+        Write-Log "    Size: $sizeMB MB | Downloaded: $($update.IsDownloaded) | Reboot: $rebootBehavior"
 
         if (-not $update.EulaAccepted) {
             Write-Log '    Accepting licence agreement'
             $update.AcceptEula()
         }
-        [void]$toInstall.Add($update)
+
+        [void]$pendingUpdates.Add($update)
+        $totalSizeMB += $sizeMB
     }
-    Write-Log "Total download size (max): $totalMB MB"
+
+    if ($updateCount -gt 0) {
+        Write-Log "Total download size (max): $totalSizeMB MB"
+    }
+
+    # The leading comma stops PowerShell from unrolling the collection.
+    return , $pendingUpdates
+}
+
+<#
+.SYNOPSIS
+    Downloads the updates one at a time and returns the ones that downloaded.
+.DESCRIPTION
+    Downloading one by one gives a log line per update with its result, time
+    taken and HResult, so a slow or failing update is easy to spot.
+    Updates that are already downloaded are skipped. Any failed download marks
+    the run as failed.
+    Returns a Microsoft.Update.UpdateColl, which may be empty.
+#>
+function Save-PendingUpdates {
+    param(
+        $UpdateSession,
+        $Updates
+    )
+
+    $downloader        = $UpdateSession.CreateUpdateDownloader()
+    $downloadedUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
+    $failedCount       = 0
+
+    for ($index = 0; $index -lt $Updates.Count; $index++) {
+        $update      = $Updates.Item($index)
+        $updateLabel = "[$($index + 1)/$($Updates.Count)] $($update.Title)"
+
+        if ($update.IsDownloaded) {
+            Write-Log "Already downloaded: $updateLabel"
+            [void]$downloadedUpdates.Add($update)
+            continue
+        }
+
+        Write-Log "Downloading: $updateLabel"
+
+        $singleUpdate = New-Object -ComObject Microsoft.Update.UpdateColl
+        [void]$singleUpdate.Add($update)
+        $downloader.Updates = $singleUpdate
+
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $downloadResult = $downloader.Download()
+            $resultName     = $WUResultNames[[int]$downloadResult.ResultCode]
+            $seconds        = [int]$stopwatch.Elapsed.TotalSeconds
+            $hResult        = Format-HResult $downloadResult.HResult
+
+            Write-Log "    $resultName in $seconds s (HResult $hResult)"
+        } catch {
+            Write-Log "    Download error: $($_.Exception.Message)"
+        }
+
+        if ($update.IsDownloaded) {
+            [void]$downloadedUpdates.Add($update)
+        } else {
+            $failedCount++
+            $script:Failed = $true
+        }
+    }
+
+    Write-Log "Downloads: $($downloadedUpdates.Count) ready, $failedCount failed"
+
+    # The leading comma stops PowerShell from unrolling the collection.
+    return , $downloadedUpdates
+}
+
+<#
+.SYNOPSIS
+    Installs the downloaded updates in one batch and logs each result.
+.DESCRIPTION
+    One batch lets Windows install prerequisites, such as servicing stack
+    updates, in the right order.
+    Logs the overall result, then the result, HResult and reboot need of each
+    update, then a summary. A failed install marks the run as failed; a reboot
+    request sets $script:RebootRequired.
+#>
+function Install-DownloadedUpdates {
+    param(
+        $UpdateSession,
+        $Updates
+    )
+
+    Write-Log "Installing $($Updates.Count) update(s), this can take a while..."
+
+    $installer         = $UpdateSession.CreateUpdateInstaller()
+    $installer.Updates = $Updates
+
+    $stopwatch     = [Diagnostics.Stopwatch]::StartNew()
+    $installResult = $installer.Install()
+    $minutes       = [int]$stopwatch.Elapsed.TotalMinutes
+    $resultName    = $WUResultNames[[int]$installResult.ResultCode]
+    $hResult       = Format-HResult $installResult.HResult
+
+    Write-Log "Install finished in $minutes min, result: $resultName (HResult $hResult)"
+
+    if ([int]$installResult.ResultCode -ne $WUResultSucceeded) {
+        $script:Failed = $true
+    }
+
+    $installedCount = 0
+    $failedCount    = 0
+
+    for ($index = 0; $index -lt $Updates.Count; $index++) {
+        $updateResult     = $installResult.GetUpdateResult($index)
+        $updateResultCode = [int]$updateResult.ResultCode
+        $updateTitle      = $Updates.Item($index).Title
+
+        if ($updateResultCode -eq $WUResultSucceeded) {
+            $installedCount++
+        } else {
+            $failedCount++
+        }
+
+        Write-Log "[$($index + 1)/$($Updates.Count)] $($WUResultNames[$updateResultCode]): $updateTitle"
+        Write-Log "    HResult $(Format-HResult $updateResult.HResult) | Reboot required: $($updateResult.RebootRequired)"
+    }
+
+    Write-Log "Install summary: $installedCount installed, $failedCount failed"
+
+    if ($installResult.RebootRequired) {
+        Write-Log 'A reboot is required to finish installing updates.'
+        $script:RebootRequired = $true
+    }
+}
+
+<#
+.SYNOPSIS
+    Scans, downloads and installs updates through the Windows Update Agent API.
+.DESCRIPTION
+    Uses the Microsoft.Update.Session COM object, the same API Windows Update
+    itself uses. Stops after the scan when -SkipInstall is used.
+#>
+function Invoke-WUInstall {
+    $agentVersion = (Get-Item "$env:SystemRoot\System32\wuaueng.dll").VersionInfo.ProductVersion
+    Write-Log "Windows Update Agent version: $agentVersion"
+
+    $updateSession = New-Object -ComObject Microsoft.Update.Session
+    $updateSession.ClientApplicationID = 'Reset-WindowsUpdate'
+
+    $pendingUpdates = Find-PendingUpdates -UpdateSession $updateSession
+    if ($pendingUpdates.Count -eq 0) {
+        return
+    }
 
     if ($SkipInstall) {
         Write-Log 'SkipInstall set, not downloading or installing.'
         return
     }
 
-    # ---- 3. download, one update at a time for per-update progress
-    $downloader = $session.CreateUpdateDownloader()
-    $downloaded = New-Object -ComObject Microsoft.Update.UpdateColl
-    $failedDownloads = 0
-    for ($i = 0; $i -lt $toInstall.Count; $i++) {
-        $update = $toInstall.Item($i)
-        $label  = "[$($i + 1)/$($toInstall.Count)] $($update.Title)"
-        if ($update.IsDownloaded) {
-            Write-Log "Already downloaded: $label"
-            [void]$downloaded.Add($update)
-            continue
-        }
-        Write-Log "Downloading: $label"
-        $single = New-Object -ComObject Microsoft.Update.UpdateColl
-        [void]$single.Add($update)
-        $downloader.Updates = $single
-        $timer = [Diagnostics.Stopwatch]::StartNew()
-        try {
-            $result = $downloader.Download()
-            $code   = [int]$result.ResultCode
-            Write-Log "    $($resultText[$code]) in $([int]$timer.Elapsed.TotalSeconds) s (HResult $(Format-HResult $result.HResult))"
-        } catch {
-            Write-Log "    Download error: $($_.Exception.Message)"
-        }
-        if ($update.IsDownloaded) {
-            [void]$downloaded.Add($update)
-        } else {
-            $failedDownloads++
-            $script:Failed = $true
-        }
-    }
-    Write-Log "Downloads: $($downloaded.Count) ready, $failedDownloads failed"
-    if ($downloaded.Count -eq 0) {
+    $downloadedUpdates = Save-PendingUpdates -UpdateSession $updateSession -Updates $pendingUpdates
+    if ($downloadedUpdates.Count -eq 0) {
         Write-Log 'No updates were downloaded, nothing to install.'
         $script:Failed = $true
         return
     }
 
-    # ---- 4. install, as one batch
-    Write-Log "Installing $($downloaded.Count) update(s), this can take a while..."
-    $installer = $session.CreateUpdateInstaller()
-    $installer.Updates = $downloaded
-    $timer   = [Diagnostics.Stopwatch]::StartNew()
-    $install = $installer.Install()
-    $code    = [int]$install.ResultCode
-    Write-Log "Install finished in $([int]$timer.Elapsed.TotalMinutes) min, result: $($resultText[$code]) (HResult $(Format-HResult $install.HResult))"
-    if ($code -ne 2) { $script:Failed = $true }
-
-    # ---- 5. per-update results and summary
-    $installed      = 0
-    $failedInstalls = 0
-    for ($i = 0; $i -lt $downloaded.Count; $i++) {
-        $r    = $install.GetUpdateResult($i)
-        $rc   = [int]$r.ResultCode
-        if ($rc -eq 2) { $installed++ } else { $failedInstalls++ }
-        Write-Log "[$($i + 1)/$($downloaded.Count)] $($resultText[$rc]): $($downloaded.Item($i).Title)"
-        Write-Log "    HResult $(Format-HResult $r.HResult) | Reboot required: $($r.RebootRequired)"
-    }
-    Write-Log "Summary: $installed installed, $failedInstalls failed, $failedDownloads not downloaded"
-
-    if ($install.RebootRequired) {
-        Write-Log 'A reboot is required to finish installing updates.'
-        $script:RebootRequired = $true
-    }
+    Install-DownloadedUpdates -UpdateSession $updateSession -Updates $downloadedUpdates
 }
 
-# ------------------------------------------------------------------- main ---
-# Order matters: checks that change nothing run first, so a device that can't
-# be fixed by this script is left untouched. Any unexpected error restarts the
-# services so the device isn't left without Windows Update.
+#endregion
+
+
+#region Main ==================================================================
+
+# Order matters: checks that change nothing run first, so a device this script
+# can't fix is left untouched. Any unexpected error restarts the services so the
+# device isn't left without Windows Update.
+
 New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
 Write-Log "=== Windows Update reset started on $env:COMPUTERNAME as $env:USERNAME ==="
 
 try {
-    if (-not (Test-ServiceStartup)) { exit 1 }
+    # Checks: stop before changing anything if the device can't be fixed now.
+    if (-not (Test-ServiceStartup)) {
+        exit 1
+    }
+
     if ((Test-PendingReboot) -and -not $IgnorePendingReboot) {
         Write-Log 'Reboot the device first, or run with -IgnorePendingReboot.'
         exit 1
     }
-    Remove-OldBackups
-    if (-not (Test-DriveSpace)) { exit 1 }
 
+    Remove-OldBackups
+
+    if (-not (Test-DriveSpace)) {
+        exit 1
+    }
+
+    # Reset.
     Stop-WUServices
     Reset-WUFolders
     Register-WUDlls
     Start-WUServices
-    if ($Repair) { Invoke-Repair }
+
+    if ($Repair) {
+        Invoke-Repair
+    }
+
+    # Update.
     Invoke-WUInstall
 } catch {
     Write-Log "Unexpected error: $($_.Exception.Message)"
@@ -513,14 +789,18 @@ try {
     Start-WUServices
 }
 
-# Last line is what most MDM consoles show as the script output.
+# The last line is what most MDM consoles show as the script output.
 if ($script:Failed) {
     Write-Log 'RESULT: Failed, see log for details.'
     exit 1
 }
+
 if ($script:RebootRequired) {
     Write-Log 'RESULT: Success, reboot required.'
     exit $RebootExitCode
 }
+
 Write-Log 'RESULT: Success.'
 exit 0
+
+#endregion

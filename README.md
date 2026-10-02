@@ -11,9 +11,10 @@ Built to run unattended from MDM as SYSTEM.
 4. Renames `SoftwareDistribution` and `catroot2` to `*.bak_<timestamp>` (3 attempts)
 5. Re-registers the Windows Update DLLs (skips any not present)
 6. Starts the services again
-7. Scans, downloads and installs updates using the `Microsoft.Update.Session` COM object
+7. With `-Repair`: runs `DISM /RestoreHealth` and `sfc /scannow`
+8. Scans, downloads and installs updates using the `Microsoft.Update.Session` COM object
 
-Every step is written to a timestamped log in `C:\Windows\Logs\WUReset\`.
+Every step is written to `C:\Windows\Logs\WUReset\` as one line per step: a timestamp and a message.
 The last line of output is a `RESULT:` summary, which MDM consoles show as the script output.
 
 ## Usage
@@ -31,6 +32,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 | `-LogPath`             | `C:\Windows\Logs\WUReset` | Folder for the log file                          |
 | `-SkipInstall`         | off                       | Reset and scan only, no install                  |
 | `-IgnorePendingReboot` | off                       | Run even if a reboot is already pending          |
+| `-Repair`              | off                       | Run DISM and SFC after the reset (15-30+ min)    |
 | `-RebootExitCode`      | `0`                       | Exit code when a reboot is required              |
 
 ## Exit codes
@@ -49,6 +51,6 @@ Win32 app so it's reported as a soft reboot.
 
 - Run as SYSTEM (Intune: "Run this script using the logged on credentials" = **No**).
 - 32-bit PowerShell is detected and the script relaunches itself in 64-bit PowerShell.
-- Downloading and installing can take a long time; MDM script timeouts may cut it off on slow devices.
+- Downloading and installing (and `-Repair`) can take a long time; MDM script timeouts may cut it off on slow devices.
 - Don't run it over remote PowerShell (`Invoke-Command` / `Enter-PSSession`): the update COM
   object refuses to download or install from a remote session.

@@ -12,7 +12,8 @@
     4. Renames the SoftwareDistribution and catroot2 folders
     5. Re-registers the Windows Update DLLs
     6. Starts the services again
-    7. Scans, downloads and installs updates through the Microsoft.Update.Session COM object
+    7. With -Repair: runs DISM /RestoreHealth and sfc /scannow
+    8. Scans, downloads and installs updates through the Microsoft.Update.Session COM object
 
     Exit codes: 0 = success, 1 = failure, RebootExitCode = success but a reboot is required.
 
@@ -28,6 +29,9 @@
 .PARAMETER IgnorePendingReboot
     Run even if Windows already has a reboot pending.
 
+.PARAMETER Repair
+    Run DISM /RestoreHealth and sfc /scannow after the reset. Adds 15-30+ minutes.
+
 .PARAMETER RebootExitCode
     Exit code when updates installed but a reboot is required. Default: 0.
     Use 3010 when deploying as a Win32 app so the MDM treats it as a soft reboot.
@@ -42,6 +46,7 @@ param(
     [string]$LogPath = "$env:SystemRoot\Logs\WUReset",
     [switch]$SkipInstall,
     [switch]$IgnorePendingReboot,
+    [switch]$Repair,
     [int]$RebootExitCode = 0
 )
 
@@ -84,17 +89,10 @@ $script:RebootRequired = $false
 
 # ---------------------------------------------------------------- logging ---
 function Write-Log {
-    param(
-        [string]$Message,
-        [ValidateSet('INFO', 'WARN', 'ERROR')][string]$Level = 'INFO'
-    )
-    $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    param([string]$Message)
+    $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
     Add-Content -Path $LogFile -Value $line
-    switch ($Level) {
-        'ERROR' { Write-Host $line -ForegroundColor Red }
-        'WARN'  { Write-Host $line -ForegroundColor Yellow }
-        default { Write-Host $line }
-    }
+    Write-Host $line
 }
 
 # --------------------------------------------------------- pre-checks -------
@@ -102,7 +100,7 @@ function Test-ServiceStartup {
     $ok = $true
     foreach ($name in $Services) {
         if ((Get-Service -Name $name).StartType -eq 'Disabled') {
-            Write-Log "Service $name is disabled (check GPO/MDM policy)." 'ERROR'
+            Write-Log "Service $name is disabled (check GPO/MDM policy)."
             $ok = $false
         }
     }
@@ -114,7 +112,7 @@ function Test-PendingReboot {
             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
     foreach ($key in $keys) {
         if (Test-Path $key) {
-            Write-Log "Pending reboot detected: $key" 'WARN'
+            Write-Log "Pending reboot detected: $key"
             return $true
         }
     }
@@ -126,7 +124,7 @@ function Test-DriveSpace {
     $freeGB = [math]::Round($disk.FreeSpace / 1GB, 2)
     Write-Log "Free space on $env:SystemDrive : $freeGB GB (minimum $MinFreeGB GB)"
     if ($freeGB -lt $MinFreeGB) {
-        Write-Log "Not enough free space on $env:SystemDrive." 'ERROR'
+        Write-Log "Not enough free space on $env:SystemDrive."
         return $false
     }
     return $true
@@ -139,14 +137,14 @@ function Stop-ServiceProcess {
     if (-not $procId) { return }
     # Never kill a shared svchost, it would take other services down with it.
     if (@(Get-CimInstance Win32_Service -Filter "ProcessId=$procId").Count -gt 1) {
-        Write-Log "$Name shares process $procId with other services, not killing it" 'WARN'
+        Write-Log "$Name shares process $procId with other services, not killing it"
         return
     }
     try {
         Stop-Process -Id $procId -Force -ErrorAction Stop
-        Write-Log "Killed process $procId for $Name" 'WARN'
+        Write-Log "Killed process $procId for $Name"
     } catch {
-        Write-Log "Could not kill process $procId for $Name : $($_.Exception.Message)" 'WARN'
+        Write-Log "Could not kill process $procId for $Name : $($_.Exception.Message)"
     }
 }
 
@@ -159,7 +157,7 @@ function Stop-WUServices {
             Stop-Service -Name $name -Force -NoWait -ErrorAction Stop
             $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds($ServiceTimeoutSec))
         } catch {
-            Write-Log "$name did not stop within $ServiceTimeoutSec s: $($_.Exception.Message)" 'WARN'
+            Write-Log "$name did not stop within $ServiceTimeoutSec s: $($_.Exception.Message)"
             Stop-ServiceProcess $name
         }
     }
@@ -171,7 +169,7 @@ function Start-WUServices {
             Write-Log "Starting service $name"
             Start-Service -Name $name -ErrorAction Stop
         } catch {
-            Write-Log "Could not start $name : $($_.Exception.Message)" 'ERROR'
+            Write-Log "Could not start $name : $($_.Exception.Message)"
             $script:Failed = $true
         }
     }
@@ -186,7 +184,7 @@ function Remove-OldBackups {
                 Remove-Item -Path $dir.FullName -Recurse -Force -ErrorAction Stop
                 Write-Log "Removed old backup $($dir.FullName)"
             } catch {
-                Write-Log "Could not remove $($dir.FullName) : $($_.Exception.Message)" 'WARN'
+                Write-Log "Could not remove $($dir.FullName) : $($_.Exception.Message)"
             }
         }
     }
@@ -203,13 +201,13 @@ function Reset-WUFolders {
                 Write-Log "Renamed $folder -> $newName"
                 $renamed = $true
             } catch {
-                Write-Log "Rename attempt $attempt of $folder failed: $($_.Exception.Message)" 'WARN'
+                Write-Log "Rename attempt $attempt of $folder failed: $($_.Exception.Message)"
                 Start-Sleep -Seconds 5
                 Stop-WUServices   # something may have restarted a service
             }
         }
         if (-not $renamed) {
-            Write-Log "Could not rename $folder, reset is incomplete." 'ERROR'
+            Write-Log "Could not rename $folder, reset is incomplete."
             $script:Failed = $true
         }
     }
@@ -225,9 +223,22 @@ function Register-WUDlls {
         if ($proc.ExitCode -eq 0) {
             Write-Log "Registered $dll"
         } else {
-            Write-Log "regsvr32 $dll returned $($proc.ExitCode)" 'WARN'
+            Write-Log "regsvr32 $dll returned $($proc.ExitCode)"
         }
     }
+}
+
+# --------------------------------------------------------------- repair -----
+function Invoke-Repair {
+    # Runs after the reset so DISM can pull repair files from Windows Update.
+    Write-Log 'Running DISM /RestoreHealth (details in C:\Windows\Logs\DISM\dism.log)...'
+    $dism = Start-Process "$env:SystemRoot\System32\dism.exe" -ArgumentList '/Online /Cleanup-Image /RestoreHealth' -Wait -PassThru -WindowStyle Hidden
+    Write-Log "DISM exit code: $($dism.ExitCode)"
+    if ($dism.ExitCode -ne 0) { $script:Failed = $true }
+
+    Write-Log 'Running sfc /scannow (details in C:\Windows\Logs\CBS\CBS.log)...'
+    $sfc = Start-Process "$env:SystemRoot\System32\sfc.exe" -ArgumentList '/scannow' -Wait -PassThru -WindowStyle Hidden
+    Write-Log "SFC exit code: $($sfc.ExitCode)"
 }
 
 # -------------------------------------------------------- update via COM ----
@@ -259,19 +270,15 @@ function Invoke-WUInstall {
     $downloader.Updates = $toInstall
     $download = $downloader.Download()
     $code = [int]$download.ResultCode
-    if ($code -eq 2) {
-        Write-Log "Download result: $($resultText[$code])"
-    } else {
-        Write-Log "Download result: $($resultText[$code])" 'ERROR'
-        $script:Failed = $true
-    }
+    Write-Log "Download result: $($resultText[$code])"
+    if ($code -ne 2) { $script:Failed = $true }
 
     $downloaded = New-Object -ComObject Microsoft.Update.UpdateColl
     foreach ($update in $toInstall) {
         if ($update.IsDownloaded) { [void]$downloaded.Add($update) }
     }
     if ($downloaded.Count -eq 0) {
-        Write-Log 'No updates were downloaded, nothing to install.' 'ERROR'
+        Write-Log 'No updates were downloaded, nothing to install.'
         $script:Failed = $true
         return
     }
@@ -281,12 +288,8 @@ function Invoke-WUInstall {
     $installer.Updates = $downloaded
     $install = $installer.Install()
     $code = [int]$install.ResultCode
-    if ($code -eq 2) {
-        Write-Log "Install result: $($resultText[$code])"
-    } else {
-        Write-Log "Install result: $($resultText[$code])" 'ERROR'
-        $script:Failed = $true
-    }
+    Write-Log "Install result: $($resultText[$code])"
+    if ($code -ne 2) { $script:Failed = $true }
 
     for ($i = 0; $i -lt $downloaded.Count; $i++) {
         $code = [int]$install.GetUpdateResult($i).ResultCode
@@ -294,7 +297,7 @@ function Invoke-WUInstall {
     }
 
     if ($install.RebootRequired) {
-        Write-Log 'A reboot is required to finish installing updates.' 'WARN'
+        Write-Log 'A reboot is required to finish installing updates.'
         $script:RebootRequired = $true
     }
 }
@@ -306,7 +309,7 @@ Write-Log "=== Windows Update reset started on $env:COMPUTERNAME as $env:USERNAM
 try {
     if (-not (Test-ServiceStartup)) { exit 1 }
     if ((Test-PendingReboot) -and -not $IgnorePendingReboot) {
-        Write-Log 'Reboot the device first, or run with -IgnorePendingReboot.' 'ERROR'
+        Write-Log 'Reboot the device first, or run with -IgnorePendingReboot.'
         exit 1
     }
     Remove-OldBackups
@@ -316,16 +319,17 @@ try {
     Reset-WUFolders
     Register-WUDlls
     Start-WUServices
+    if ($Repair) { Invoke-Repair }
     Invoke-WUInstall
 } catch {
-    Write-Log "Unexpected error: $($_.Exception.Message)" 'ERROR'
+    Write-Log "Unexpected error: $($_.Exception.Message)"
     $script:Failed = $true
     Start-WUServices
 }
 
 # Last line is what most MDM consoles show as the script output.
 if ($script:Failed) {
-    Write-Log 'RESULT: Failed, see log for details.' 'ERROR'
+    Write-Log 'RESULT: Failed, see log for details.'
     exit 1
 }
 if ($script:RebootRequired) {

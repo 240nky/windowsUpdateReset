@@ -54,9 +54,12 @@ $ErrorActionPreference = 'Stop'
 $RunTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $LogFilePath  = Join-Path $LogPath "WUReset_$RunTimestamp.log"
 
+# Log files kept in $LogPath, including this run's.
+$LogsToKeep = 10
+
 # Services that lock the WU cache folders.
-$WUServiceNames            = 'wuauserv', 'bits', 'cryptsvc', 'msiserver'
-$ServiceStopTimeoutSeconds = 60
+$WUServiceNames        = 'wuauserv', 'bits', 'cryptsvc', 'msiserver'
+$ServiceTimeoutSeconds = 60
 
 # Update database/downloads and signature catalogs. Windows rebuilds both.
 $WUCacheFolders = "$env:SystemRoot\SoftwareDistribution", "$env:SystemRoot\System32\catroot2"
@@ -84,6 +87,30 @@ function Write-Log {
     $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
     Add-Content -Path $LogFilePath -Value $line
     Write-Host $line
+}
+
+# Deletes all but the newest $LogsToKeep log files.
+function Remove-OldLogs {
+    Get-ChildItem -Path $LogPath -Filter 'WUReset_*.log' |
+        Sort-Object Name -Descending |
+        Select-Object -Skip $LogsToKeep |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
+# Writes the RESULT line (MDM consoles show the last line) and exits with the matching code.
+function Exit-WithResult {
+    param([switch]$Failure)
+    if ($Failure) { $script:Failed = $true }
+    if ($script:Failed) {
+        Write-Log 'RESULT: Failed, see log for details.'
+        exit 1
+    }
+    if ($script:RebootRequired) {
+        Write-Log 'RESULT: Success, reboot required.'
+        exit $RebootExitCode
+    }
+    Write-Log 'RESULT: Success.'
+    exit 0
 }
 
 # --------------------------------------------------------- pre-checks -------
@@ -128,24 +155,43 @@ function Test-DriveSpace {
 }
 
 # --------------------------------------------------------------- services ---
-# Kills a stuck service's process, unless it's a shared svchost.
-function Stop-ServiceProcess {
+# True when every WU service is in the given state; logs any that aren't.
+function Test-ServicesInState {
+    param([string]$State)
+    $allInState = $true
+    foreach ($serviceName in $WUServiceNames) {
+        $status = (Get-Service -Name $serviceName).Status
+        if ($status -ne $State) {
+            Write-Log "Service $serviceName is $status, expected $State"
+            $allInState = $false
+        }
+    }
+    return $allInState
+}
+
+# Mike F Robbins' method: ends the process of a service stuck in Stop Pending, unless it's a shared svchost.
+function Stop-HungService {
     param([string]$ServiceName)
-    $serviceProcessId = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'").ProcessId
-    if (-not $serviceProcessId) { return }
+    $hungService = Get-CimInstance Win32_Service -Filter "Name='$ServiceName' AND State='Stop Pending'"
+    if (-not $hungService) {
+        Write-Log "$ServiceName is not in Stop Pending, leaving it alone"
+        return
+    }
+    $serviceProcessId = $hungService.ProcessId
     if (@(Get-CimInstance Win32_Service -Filter "ProcessId=$serviceProcessId").Count -gt 1) {
-        Write-Log "$ServiceName shares process $serviceProcessId with other services, not killing it"
+        Write-Log "$ServiceName shares process $serviceProcessId with other services, not ending it"
         return
     }
     try {
         Stop-Process -Id $serviceProcessId -Force -ErrorAction Stop
-        Write-Log "Killed process $serviceProcessId for $ServiceName"
+        Write-Log "Ended process $serviceProcessId of hung service $ServiceName"
+        (Get-Service -Name $ServiceName).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
     } catch {
-        Write-Log "Could not kill process $serviceProcessId for $ServiceName : $($_.Exception.Message)"
+        Write-Log "Could not end process $serviceProcessId of $ServiceName : $($_.Exception.Message)"
     }
 }
 
-# Stops the WU services, killing any that don't stop in time. Safe to re-run.
+# Stops the WU services and waits for each. True only when all are stopped. Safe to re-run.
 function Stop-WUServices {
     foreach ($serviceName in $WUServiceNames) {
         $service = Get-Service -Name $serviceName
@@ -153,25 +199,31 @@ function Stop-WUServices {
         Write-Log "Stopping service $serviceName"
         try {
             Stop-Service -Name $serviceName -Force -NoWait -ErrorAction Stop
-            $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds($ServiceStopTimeoutSeconds))
+            $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds($ServiceTimeoutSeconds))
+            Write-Log "Service $serviceName stopped"
         } catch {
-            Write-Log "$serviceName did not stop within $ServiceStopTimeoutSeconds s: $($_.Exception.Message)"
-            Stop-ServiceProcess $serviceName
+            Write-Log "$serviceName did not stop within $ServiceTimeoutSeconds s: $($_.Exception.Message)"
+            Stop-HungService $serviceName
         }
     }
+    return Test-ServicesInState -State 'Stopped'
 }
 
-# Starts the WU services. A failure fails the run.
+# Starts the WU services and waits for each. True only when all are running.
 function Start-WUServices {
     foreach ($serviceName in $WUServiceNames) {
+        $service = Get-Service -Name $serviceName
+        if ($service.Status -eq 'Running') { continue }
+        Write-Log "Starting service $serviceName"
         try {
-            Write-Log "Starting service $serviceName"
-            Start-Service -Name $serviceName -ErrorAction Stop
+            if ($service.Status -ne 'StartPending') { $service.Start() }
+            $service.WaitForStatus('Running', [TimeSpan]::FromSeconds($ServiceTimeoutSeconds))
+            Write-Log "Service $serviceName running"
         } catch {
-            Write-Log "Could not start $serviceName : $($_.Exception.Message)"
-            $script:Failed = $true
+            Write-Log "$serviceName did not start within $ServiceTimeoutSeconds s: $($_.Exception.Message)"
         }
     }
+    return Test-ServicesInState -State 'Running'
 }
 
 # ------------------------------------------------------- cache folders ------
@@ -207,7 +259,7 @@ function Reset-WUFolders {
             } catch {
                 Write-Log "Rename attempt $attempt of $cacheFolder failed: $($_.Exception.Message)"
                 Start-Sleep -Seconds 5
-                Stop-WUServices
+                $null = Stop-WUServices
             }
         }
         if (-not $isRenamed) {
@@ -279,7 +331,8 @@ function Invoke-WUInstall {
     # Update reboot behaviour.
     $rebootBehaviorNames = @{ 0 = 'No reboot'; 1 = 'Always needs reboot'; 2 = 'May need reboot' }
 
-    $agentVersion = (Get-Item "$env:SystemRoot\System32\wuaueng.dll").VersionInfo.ProductVersion
+    $agentVersion = (Get-Item "$env:SystemRoot\System32\wuaueng.dll" -ErrorAction SilentlyContinue).VersionInfo.ProductVersion
+    if (-not $agentVersion) { $agentVersion = 'unknown' }
     Write-Log "Windows Update Agent version: $agentVersion"
 
     $updateSession = New-Object -ComObject Microsoft.Update.Session
@@ -292,6 +345,11 @@ function Invoke-WUInstall {
     $stopwatch    = [Diagnostics.Stopwatch]::StartNew()
     $searchResult = $searcher.Search($searchCriteria)
     Write-Log "Scan finished in $([int]$stopwatch.Elapsed.TotalSeconds) s, result: $($resultNames[[int]$searchResult.ResultCode])"
+    if ([int]$searchResult.ResultCode -ne 2) {
+        Write-Log 'Scan did not succeed, not installing anything.'
+        $script:Failed = $true
+        return
+    }
     Write-Log "Found $($searchResult.Updates.Count) update(s)"
     if ($searchResult.Updates.Count -eq 0) { return }
 
@@ -299,6 +357,7 @@ function Invoke-WUInstall {
     $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
     $totalSizeMB      = 0
     $updateNumber     = 0
+    $skippedCount     = 0
     foreach ($update in $searchResult.Updates) {
         $updateNumber++
         $kbNumbers      = (@($update.KBArticleIDs) | ForEach-Object { "KB$_" }) -join ', '
@@ -306,19 +365,26 @@ function Invoke-WUInstall {
         $sizeMB         = [math]::Round($update.MaxDownloadSize / 1MB, 1)
         $severity       = if ($update.MsrcSeverity) { $update.MsrcSeverity } else { 'n/a' }
         $rebootBehavior = $rebootBehaviorNames[[int]$update.InstallationBehavior.RebootBehavior]
-        $totalSizeMB   += $sizeMB
 
         Write-Log "[$updateNumber/$($searchResult.Updates.Count)] $($update.Title)"
         Write-Log "    KB: $kbNumbers | Category: $categories | Severity: $severity"
         Write-Log "    Size: $sizeMB MB | Downloaded: $($update.IsDownloaded) | Reboot: $rebootBehavior"
 
+        # Nobody can answer a prompt when running unattended as SYSTEM.
+        if ($update.InstallationBehavior.CanRequestUserInput) {
+            Write-Log '    Skipped: this update may ask for user input'
+            $skippedCount++
+            continue
+        }
         if (-not $update.EulaAccepted) {
             Write-Log '    Accepting licence agreement'
             $update.AcceptEula()
         }
         [void]$updatesToInstall.Add($update)
+        $totalSizeMB += $sizeMB
     }
-    Write-Log "Total download size (max): $totalSizeMB MB"
+    Write-Log "To install: $($updatesToInstall.Count), skipped: $skippedCount, total download size (max): $totalSizeMB MB"
+    if ($updatesToInstall.Count -eq 0) { return }
 
     if ($SkipInstall) {
         Write-Log 'SkipInstall set, not downloading or installing.'
@@ -397,34 +463,41 @@ New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
 Write-Log "=== Windows Update reset started on $env:COMPUTERNAME as $env:USERNAME ==="
 
 try {
-    if (-not (Test-ServiceStartup)) { exit 1 }
+    Remove-OldLogs
+    if (-not (Test-ServiceStartup)) { Exit-WithResult -Failure }
     if ((Test-PendingReboot) -and -not $IgnorePendingReboot) {
         Write-Log 'Reboot the device first, or run with -IgnorePendingReboot.'
-        exit 1
+        Exit-WithResult -Failure
     }
     Remove-OldBackups
-    if (-not (Test-DriveSpace)) { exit 1 }
+    if (-not (Test-DriveSpace)) { Exit-WithResult -Failure }
 
-    Stop-WUServices
+    # Only touch the cache folders once every service is confirmed stopped.
+    # Retried because Windows can restart a service right after it stops.
+    $allStopped = $false
+    for ($attempt = 1; $attempt -le 3 -and -not $allStopped; $attempt++) {
+        $allStopped = Stop-WUServices
+        if (-not $allStopped) { Start-Sleep -Seconds 5 }
+    }
+    if (-not $allStopped) {
+        Write-Log 'Not all services stopped, skipping the reset.'
+        $null = Start-WUServices
+        Exit-WithResult -Failure
+    }
     Reset-WUFolders
     Register-WUDlls
-    Start-WUServices
+
+    # Repair and updates need every service confirmed running.
+    if (-not (Start-WUServices)) {
+        Write-Log 'Not all services started, skipping repair and updates.'
+        Exit-WithResult -Failure
+    }
     if ($Repair) { Invoke-Repair }
     Invoke-WUInstall
 } catch {
     Write-Log "Unexpected error: $($_.Exception.Message)"
     $script:Failed = $true
-    Start-WUServices
+    $null = Start-WUServices
 }
 
-# MDM consoles show the last line.
-if ($script:Failed) {
-    Write-Log 'RESULT: Failed, see log for details.'
-    exit 1
-}
-if ($script:RebootRequired) {
-    Write-Log 'RESULT: Success, reboot required.'
-    exit $RebootExitCode
-}
-Write-Log 'RESULT: Success.'
-exit 0
+Exit-WithResult

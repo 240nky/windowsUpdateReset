@@ -15,7 +15,7 @@
     7. With -Repair: runs DISM /RestoreHealth and sfc /scannow
     8. Scans, downloads and installs updates through the Microsoft.Update.Session COM object
 
-    Exit codes: 0 = success, 1 = failure, RebootExitCode = success but a reboot is required.
+    Exit codes: 0 = success, 1 = failure.
 
 .PARAMETER MinFreeGB
     Minimum free space (GB) required on the system drive. Default: 10.
@@ -32,10 +32,6 @@
 .PARAMETER Repair
     Run DISM /RestoreHealth and sfc /scannow after the reset. Adds 15-30+ minutes.
 
-.PARAMETER RebootExitCode
-    Exit code when updates installed but a reboot is required. Default: 0.
-    Use 3010 when deploying as a Win32 app so the MDM treats it as a soft reboot.
-
 .EXAMPLE
     .\Reset-WindowsUpdate.ps1
     .\Reset-WindowsUpdate.ps1 -MinFreeGB 20 -SkipInstall
@@ -46,8 +42,7 @@ param(
     [string]$LogPath = "$env:SystemRoot\Logs\WUReset",
     [switch]$SkipInstall,
     [switch]$IgnorePendingReboot,
-    [switch]$Repair,
-    [int]$RebootExitCode = 0
+    [switch]$Repair
 )
 
 $ErrorActionPreference = 'Stop'
@@ -76,9 +71,8 @@ $WUDllNames = @(
     'wuwebv.dll'
 )
 
-# These two decide the exit code.
-$script:Failed         = $false
-$script:RebootRequired = $false
+# Set by any step that fails; decides the exit code.
+$script:Failed = $false
 
 # ---------------------------------------------------------------- logging ---
 # Timestamped line to the log file and console.
@@ -95,22 +89,6 @@ function Remove-OldLogs {
         Sort-Object Name -Descending |
         Select-Object -Skip $LogsToKeep |
         Remove-Item -Force -ErrorAction SilentlyContinue
-}
-
-# Writes the RESULT line (MDM consoles show the last line) and exits with the matching code.
-function Exit-WithResult {
-    param([switch]$Failure)
-    if ($Failure) { $script:Failed = $true }
-    if ($script:Failed) {
-        Write-Log 'RESULT: Failed, see log for details.'
-        exit 1
-    }
-    if ($script:RebootRequired) {
-        Write-Log 'RESULT: Success, reboot required.'
-        exit $RebootExitCode
-    }
-    Write-Log 'RESULT: Success.'
-    exit 0
 }
 
 # --------------------------------------------------------- pre-checks -------
@@ -453,7 +431,6 @@ function Invoke-WUInstall {
 
     if ($installResult.RebootRequired) {
         Write-Log 'A reboot is required to finish installing updates.'
-        $script:RebootRequired = $true
     }
 }
 
@@ -464,13 +441,20 @@ Write-Log "=== Windows Update reset started on $env:COMPUTERNAME as $env:USERNAM
 
 try {
     Remove-OldLogs
-    if (-not (Test-ServiceStartup)) { Exit-WithResult -Failure }
+    if (-not (Test-ServiceStartup)) {
+        Write-Log 'RESULT: Failed, see log for details.'
+        exit 1
+    }
     if ((Test-PendingReboot) -and -not $IgnorePendingReboot) {
         Write-Log 'Reboot the device first, or run with -IgnorePendingReboot.'
-        Exit-WithResult -Failure
+        Write-Log 'RESULT: Failed, see log for details.'
+        exit 1
     }
     Remove-OldBackups
-    if (-not (Test-DriveSpace)) { Exit-WithResult -Failure }
+    if (-not (Test-DriveSpace)) {
+        Write-Log 'RESULT: Failed, see log for details.'
+        exit 1
+    }
 
     # Only touch the cache folders once every service is confirmed stopped.
     # Retried because Windows can restart a service right after it stops.
@@ -482,7 +466,8 @@ try {
     if (-not $allStopped) {
         Write-Log 'Not all services stopped, skipping the reset.'
         $null = Start-WUServices
-        Exit-WithResult -Failure
+        Write-Log 'RESULT: Failed, see log for details.'
+        exit 1
     }
     Reset-WUFolders
     Register-WUDlls
@@ -490,7 +475,8 @@ try {
     # Repair and updates need every service confirmed running.
     if (-not (Start-WUServices)) {
         Write-Log 'Not all services started, skipping repair and updates.'
-        Exit-WithResult -Failure
+        Write-Log 'RESULT: Failed, see log for details.'
+        exit 1
     }
     if ($Repair) { Invoke-Repair }
     Invoke-WUInstall
@@ -500,4 +486,9 @@ try {
     $null = Start-WUServices
 }
 
-Exit-WithResult
+if ($script:Failed) {
+    Write-Log 'RESULT: Failed, see log for details.'
+    exit 1
+}
+Write-Log 'RESULT: Success.'
+exit 0
